@@ -130,7 +130,12 @@ impl App {
             let log = move |m: String| {
                 let _ = tx_log.send(Evento::Log(m));
             };
-            let resultado = engine::executar(&cfg, &ctl_thread, &log);
+            // Um pânico no motor vira falha na tela (o hook do pânico já registra no log),
+            // em vez de deixar a interface presa em "em andamento".
+            let resultado = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                engine::executar(&cfg, &ctl_thread, &log)
+            }))
+            .unwrap_or_else(|_| Err(ErroDl::Outro("erro interno inesperado (veja o log)".into())));
             let evento = match resultado {
                 Ok(()) => Evento::Concluido(cfg.destino.display().to_string()),
                 Err(ErroDl::Cancelado) => Evento::Cancelado,

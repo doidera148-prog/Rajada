@@ -14,6 +14,8 @@ use std::time::{Duration, Instant};
 const CHUNK: usize = 256 * 1024;
 /// Buffer usado na junção final das partes.
 const BUFFER_JUNCAO: usize = 4 * 1024 * 1024;
+/// Tamanho mínimo de cada parte. Partes menores não compensam o paralelismo.
+const MIN_PARTE: u64 = 1024 * 1024;
 const TENTATIVAS: u32 = 5;
 const TIMEOUT: Duration = Duration::from_secs(15);
 
@@ -81,7 +83,9 @@ impl Limitador {
         Self { taxa: taxa_bytes, inicio: Instant::now(), consumido: Mutex::new(0) }
     }
 
-    fn aguardar(&self, n: usize) {
+    /// Espera o necessário para respeitar o limite. O sono é fatiado para que
+    /// o cancelamento continue respondendo mesmo com limites muito baixos.
+    fn aguardar(&self, n: usize, ctl: &Ctl) {
         if self.taxa == 0 {
             return;
         }
@@ -90,9 +94,11 @@ impl Limitador {
             *c += n as u64;
             Duration::from_secs_f64(*c as f64 / self.taxa as f64)
         };
-        let decorrido = self.inicio.elapsed();
-        if esperado > decorrido {
-            thread::sleep(esperado - decorrido);
+        let mut restante = esperado.saturating_sub(self.inicio.elapsed());
+        while restante > Duration::ZERO && !ctl.cancelado() {
+            let passo = restante.min(Duration::from_millis(100));
+            thread::sleep(passo);
+            restante -= passo;
         }
     }
 }
@@ -115,6 +121,10 @@ pub fn executar(cfg: &Config, ctl: &Ctl, log: &(dyn Fn(String) + Sync)) -> Res<(
             cfg.limite_kbps
         ),
     );
+
+    if let Some(pasta) = cfg.destino.parent().filter(|p| !p.as_os_str().is_empty()) {
+        fs::create_dir_all(pasta)?;
+    }
 
     log(format!("Consultando servidor: {}", cfg.url));
     let (tamanho, suporta_range, url_final) = sondar(&agent, &cfg.url)?;
@@ -229,7 +239,8 @@ fn paralelo(
     ctl: &Ctl,
     limitador: &Arc<Limitador>,
 ) -> Res<()> {
-    let n = n as u64;
+    // Nunca criar partes menores que MIN_PARTE nem partes vazias.
+    let n = (n as u64).min((tamanho / MIN_PARTE).max(1));
     let bloco = tamanho / n;
     let partes: Vec<PathBuf> = (0..n)
         .map(|i| PathBuf::from(format!("{}.part{}", destino.display(), i)))
@@ -371,7 +382,7 @@ fn tentar_parte(
             break;
         }
         arq.write_all(&buf[..n])?;
-        limitador.aguardar(n);
+        limitador.aguardar(n, ctl);
         ctl.baixado.fetch_add(n as u64, Ordering::Relaxed);
     }
 
@@ -408,7 +419,7 @@ fn simples(
             break;
         }
         arq.write_all(&buf[..n])?;
-        limitador.aguardar(n);
+        limitador.aguardar(n, ctl);
         ctl.baixado.fetch_add(n as u64, Ordering::Relaxed);
     }
     Ok(())
@@ -440,15 +451,38 @@ pub fn formatar_tempo(segundos: f64) -> String {
 }
 
 /// Nome do arquivo a partir da URL (ignora query e fragmento).
+/// O resultado é válido em Windows, Linux e macOS.
 pub fn nome_da_url(url: &str) -> String {
     let semq = url.split(['?', '#']).next().unwrap_or(url);
     let ultimo = semq.rsplit('/').next().unwrap_or("");
-    let decodificado = percent_decode(ultimo);
-    if decodificado.is_empty() {
-        "download.bin".to_string()
-    } else {
-        decodificado
+    sanitizar_nome(&percent_decode(ultimo))
+}
+
+/// Remove caracteres proibidos no Windows, nomes reservados e nomes vazios.
+fn sanitizar_nome(nome: &str) -> String {
+    const PADRAO: &str = "download.bin";
+    const PROIBIDOS: &str = "<>:\"/\\|?*";
+    const RESERVADOS: [&str; 22] = [
+        "CON", "PRN", "AUX", "NUL", "COM1", "COM2", "COM3", "COM4", "COM5", "COM6", "COM7",
+        "COM8", "COM9", "LPT1", "LPT2", "LPT3", "LPT4", "LPT5", "LPT6", "LPT7", "LPT8", "LPT9",
+    ];
+
+    let limpo: String = nome
+        .chars()
+        .map(|c| if PROIBIDOS.contains(c) || c.is_control() { '_' } else { c })
+        .collect();
+    // Windows não aceita espaço ou ponto no fim do nome.
+    let limpo = limpo.trim().trim_end_matches('.');
+    let limpo: String = limpo.chars().take(200).collect();
+
+    if limpo.is_empty() || limpo == "." || limpo == ".." {
+        return PADRAO.to_string();
     }
+    let raiz = limpo.split('.').next().unwrap_or("").to_ascii_uppercase();
+    if RESERVADOS.contains(&raiz.as_str()) {
+        return format!("_{limpo}");
+    }
+    limpo
 }
 
 fn percent_decode(s: &str) -> String {
@@ -636,6 +670,58 @@ mod tests {
         assert_eq!(nome_da_url("https://x.com/pasta/arquivo.zip?token=1"), "arquivo.zip");
         assert_eq!(nome_da_url("https://x.com/a%20b.pdf#topo"), "a b.pdf");
         assert_eq!(nome_da_url("https://x.com/"), "download.bin");
+    }
+
+    #[test]
+    fn cancelamento_responde_rapido_com_limite_baixo() {
+        // 300 KB a 10 KB/s: sem o sono fatiado, um bloco dormiria ~25 s.
+        let dados = dados_de_teste(300_000);
+        let url = servidor(Arc::clone(&dados), true);
+        let dir = pasta_tmp("cancela_rapido");
+        let destino = dir.join("saida.bin");
+        let ctl = Ctl::default();
+        let ctl2 = ctl.clone();
+        thread::spawn(move || {
+            thread::sleep(Duration::from_millis(300));
+            ctl2.cancelar.store(true, Ordering::Relaxed);
+        });
+        let inicio = Instant::now();
+        let res = executar(&cfg(url, destino, 4, 10), &ctl, &nao_loga);
+        assert!(matches!(res, Err(ErroDl::Cancelado)));
+        assert!(inicio.elapsed() < Duration::from_secs(3), "cancelamento demorou demais");
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn arquivo_pequeno_com_muitas_conexoes() {
+        let dados = dados_de_teste(10_000);
+        let url = servidor(Arc::clone(&dados), true);
+        let dir = pasta_tmp("pequeno");
+        let destino = dir.join("saida.bin");
+        executar(&cfg(url, destino.clone(), 32, 0), &Ctl::default(), &nao_loga).unwrap();
+        assert_eq!(fs::read(&destino).unwrap(), *dados);
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn cria_pasta_de_destino_inexistente() {
+        let dados = dados_de_teste(5_000);
+        let url = servidor(Arc::clone(&dados), false);
+        let dir = pasta_tmp("pasta_nova");
+        let destino = dir.join("sub").join("pasta").join("saida.bin");
+        executar(&cfg(url, destino.clone(), 1, 0), &Ctl::default(), &nao_loga).unwrap();
+        assert_eq!(fs::read(&destino).unwrap(), *dados);
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn sanitiza_nomes_para_todos_os_sistemas() {
+        assert_eq!(sanitizar_nome("a:b*c?.txt"), "a_b_c_.txt");
+        assert_eq!(sanitizar_nome("CON.txt"), "_CON.txt");
+        assert_eq!(sanitizar_nome("com1"), "_com1");
+        assert_eq!(sanitizar_nome("..."), "download.bin");
+        assert_eq!(sanitizar_nome("   "), "download.bin");
+        assert_eq!(sanitizar_nome("relatorio.pdf."), "relatorio.pdf");
     }
 
     #[test]

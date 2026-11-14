@@ -15,12 +15,37 @@ const MAX_TAMANHO: u64 = 1024 * 1024;
 static CAMINHO: OnceLock<PathBuf> = OnceLock::new();
 static TRAVA: Mutex<()> = Mutex::new(());
 
-fn pasta_de_logs() -> PathBuf {
-    let base = std::env::var_os("LOCALAPPDATA")
+/// Pasta do usuário: %USERPROFILE% no Windows, $HOME nos demais sistemas.
+fn pasta_home() -> PathBuf {
+    std::env::var_os("USERPROFILE")
         .or_else(|| std::env::var_os("HOME"))
         .map(PathBuf::from)
-        .unwrap_or_else(|| PathBuf::from("."));
-    base.join("AceleradorDownloads").join("logs")
+        .unwrap_or_else(|| PathBuf::from("."))
+}
+
+/// Pasta de logs por sistema operacional:
+///   Windows: %LOCALAPPDATA%\AceleradorDownloads\logs
+///   macOS:   ~/Library/Logs/AceleradorDownloads
+///   Linux:   $XDG_STATE_HOME/AceleradorDownloads/logs (ou ~/.local/state/...)
+fn pasta_de_logs() -> PathBuf {
+    #[cfg(target_os = "windows")]
+    {
+        let base = std::env::var_os("LOCALAPPDATA")
+            .map(PathBuf::from)
+            .unwrap_or_else(pasta_home);
+        base.join("AceleradorDownloads").join("logs")
+    }
+    #[cfg(target_os = "macos")]
+    {
+        pasta_home().join("Library").join("Logs").join("AceleradorDownloads")
+    }
+    #[cfg(not(any(target_os = "windows", target_os = "macos")))]
+    {
+        let base = std::env::var_os("XDG_STATE_HOME")
+            .map(PathBuf::from)
+            .unwrap_or_else(|| pasta_home().join(".local").join("state"));
+        base.join("AceleradorDownloads").join("logs")
+    }
 }
 
 /// Prepara o arquivo de log e instala um gancho que registra pânicos.

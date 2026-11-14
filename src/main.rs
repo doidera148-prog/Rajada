@@ -339,14 +339,14 @@ impl eframe::App for App {
                 });
         });
 
-        if let Some((titulo, texto)) = self.popup.clone() {
+        if let Some((titulo, texto)) = &self.popup {
             let mut fechar = false;
-            egui::Window::new(titulo)
+            egui::Window::new(titulo.as_str())
                 .collapsible(false)
                 .resizable(false)
                 .anchor(egui::Align2::CENTER_CENTER, [0.0, 0.0])
                 .show(ui.ctx(), |ui| {
-                    ui.label(texto);
+                    ui.label(texto.as_str());
                     ui.add_space(8.0);
                     if ui.button("OK").clicked() {
                         fechar = true;

@@ -3,14 +3,17 @@
 //! permite cancelamento. Não depende da interface gráfica.
 
 use std::fs::{self, File, OpenOptions};
-use std::io::{self, Read, Write};
+use std::io::{self, BufReader, BufWriter, Read, Write};
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
 use std::thread;
 use std::time::{Duration, Instant};
 
-const CHUNK: usize = 64 * 1024;
+/// Tamanho dos blocos de leitura/escrita. Blocos maiores reduzem chamadas de sistema.
+const CHUNK: usize = 256 * 1024;
+/// Buffer usado na junção final das partes.
+const BUFFER_JUNCAO: usize = 4 * 1024 * 1024;
 const TENTATIVAS: u32 = 5;
 const TIMEOUT: Duration = Duration::from_secs(15);
 
@@ -275,9 +278,9 @@ fn paralelo(
 
     // Junta as partes na ordem e remove os temporários.
     crate::registro::registrar("INFO", format!("Juntando {n} partes"));
-    let mut saida = File::create(destino)?;
+    let mut saida = BufWriter::with_capacity(BUFFER_JUNCAO, File::create(destino)?);
     for parte in &partes {
-        let mut entrada = File::open(parte)?;
+        let mut entrada = BufReader::with_capacity(BUFFER_JUNCAO, File::open(parte)?);
         io::copy(&mut entrada, &mut saida)?;
         fs::remove_file(parte)?;
     }
@@ -498,10 +501,10 @@ mod tests {
                         if h.is_empty() {
                             break;
                         }
-                        if let Some((k, v)) = h.split_once(':') {
-                            if k.eq_ignore_ascii_case("range") {
-                                range = Some(v.trim().to_string());
-                            }
+                        if let Some((k, v)) = h.split_once(':')
+                            && k.eq_ignore_ascii_case("range")
+                        {
+                            range = Some(v.trim().to_string());
                         }
                     }
                     let tam = dados.len();
@@ -513,7 +516,7 @@ mod tests {
                         let _ = stream.write_all(cab("200 OK", aceita, tam).as_bytes());
                         return;
                     }
-                    let parcial = suporta_range && range.as_deref().map_or(false, |r| r.starts_with("bytes="));
+                    let parcial = suporta_range && range.as_deref().is_some_and(|r| r.starts_with("bytes="));
                     if parcial {
                         let spec = range.unwrap();
                         let spec = spec.trim_start_matches("bytes=");

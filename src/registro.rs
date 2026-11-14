@@ -1,0 +1,87 @@
+//! Registro de eventos em arquivo.
+//!
+//! No Windows, o executável de release não tem console, então erros
+//! e pânicos não apareceriam em lugar nenhum. Este módulo grava tudo em:
+//!   %LOCALAPPDATA%\AceleradorDownloads\logs\acelerador.log
+//! Quando o arquivo passa de 1 MB, ele é renomeado para acelerador.log.old.
+
+use std::fs::{self, OpenOptions};
+use std::io::Write;
+use std::path::PathBuf;
+use std::sync::{Mutex, OnceLock};
+
+const MAX_TAMANHO: u64 = 1024 * 1024;
+
+static CAMINHO: OnceLock<PathBuf> = OnceLock::new();
+static TRAVA: Mutex<()> = Mutex::new(());
+
+fn pasta_de_logs() -> PathBuf {
+    let base = std::env::var_os("LOCALAPPDATA")
+        .or_else(|| std::env::var_os("HOME"))
+        .map(PathBuf::from)
+        .unwrap_or_else(|| PathBuf::from("."));
+    base.join("AceleradorDownloads").join("logs")
+}
+
+/// Prepara o arquivo de log e instala um gancho que registra pânicos.
+/// Retorna o caminho do arquivo, para mostrar ao usuário se necessário.
+pub fn iniciar() -> PathBuf {
+    let pasta = pasta_de_logs();
+    let _ = fs::create_dir_all(&pasta);
+    let caminho = pasta.join("acelerador.log");
+    let _ = CAMINHO.set(caminho.clone());
+
+    std::panic::set_hook(Box::new(|info| {
+        let local = info
+            .location()
+            .map(|l| format!("{}:{}", l.file(), l.line()))
+            .unwrap_or_else(|| "local desconhecido".into());
+        let payload = info.payload();
+        let msg = payload
+            .downcast_ref::<&str>()
+            .map(|s| s.to_string())
+            .or_else(|| payload.downcast_ref::<String>().cloned())
+            .unwrap_or_else(|| "(sem mensagem)".into());
+        let trace = std::backtrace::Backtrace::force_capture();
+        registrar("PANIC", format!("{msg} em {local}\n{trace}"));
+    }));
+
+    caminho
+}
+
+/// Acrescenta uma linha ao log. Não faz nada se `iniciar` não foi chamado (ex.: testes).
+pub fn registrar(nivel: &str, mensagem: impl AsRef<str>) {
+    let Some(caminho) = CAMINHO.get() else {
+        return;
+    };
+    let _guarda = TRAVA.lock().unwrap_or_else(|e| e.into_inner());
+
+    if fs::metadata(caminho).map(|m| m.len()).unwrap_or(0) > MAX_TAMANHO {
+        let _ = fs::rename(caminho, caminho.with_extension("log.old"));
+    }
+
+    let agora = chrono::Local::now().format("%Y-%m-%d %H:%M:%S");
+    if let Ok(mut arquivo) = OpenOptions::new().create(true).append(true).open(caminho) {
+        let _ = writeln!(arquivo, "{agora} [{nivel:<5}] {}", mensagem.as_ref());
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn grava_linhas_e_pânico_no_arquivo() {
+        let pasta = std::env::temp_dir().join(format!("acel_log_{}", std::process::id()));
+        let _ = fs::remove_dir_all(&pasta);
+        // Aponta o registro para uma pasta temporária antes de iniciar.
+        unsafe { std::env::set_var("LOCALAPPDATA", &pasta) };
+        let caminho = iniciar();
+        registrar("INFO", "linha de teste");
+        registrar("ERROR", "erro de teste");
+        let conteudo = fs::read_to_string(&caminho).unwrap();
+        assert!(conteudo.contains("[INFO ] linha de teste"));
+        assert!(conteudo.contains("[ERROR] erro de teste"));
+        let _ = fs::remove_dir_all(&pasta);
+    }
+}

@@ -1,10 +1,17 @@
-# Binários compilados
+# Binários compilados pelo GitHub Actions
 
-- `acelerador-linux-x86_64`: Linux x86_64, compilado a partir do código do `main`.
+Gerados pelo workflow **Build** a partir do código do `main`.
 
-Para usar:
+| Arquivo | Sistema |
+|---|---|
+| `acelerador-windows-x86_64.exe` | Windows 10/11 (64 bits) |
+| `acelerador-linux-x86_64` | Linux (x86_64) |
+| `acelerador-macos-arm64` | macOS (Apple Silicon) |
 
-    chmod +x acelerador-linux-x86_64
-    ./acelerador-linux-x86_64
+## Como usar
 
-Windows e macOS: baixe pelo workflow **Build** (aba Actions do repositório).
+- **Windows:** dê dois cliques no `.exe`.
+- **Linux:** `chmod +x acelerador-linux-x86_64` e depois `./acelerador-linux-x86_64`.
+- **macOS:** `chmod +x acelerador-macos-arm64` e depois `./acelerador-macos-arm64`.
+  Na primeira execução, o macOS pode bloquear o programa por não ser assinado. Nesse caso,
+  clique com o botão direito, escolha **Abrir** e confirme.

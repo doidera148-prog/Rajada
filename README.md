@@ -1,4 +1,4 @@
-# Acelerador de Downloads
+# Rajada
 
 Programa com interface gráfica que acelera downloads dividindo o arquivo em várias
 conexões paralelas. Escrito em Rust, roda no **Windows**, **Linux** e **macOS**.
@@ -26,15 +26,15 @@ artefato do seu sistema:
 
 | Sistema | Artefato | Arquivo |
 |---|---|---|
-| Windows 10/11 | `acelerador-x86_64-pc-windows-msvc` | `acelerador.exe` |
-| Linux (x86_64) | `acelerador-x86_64-unknown-linux-gnu` | `acelerador` |
-| macOS (Apple Silicon) | `acelerador-aarch64-apple-darwin` | `acelerador` |
+| Windows 10/11 | `rajada-x86_64-pc-windows-msvc` | `rajada.exe` |
+| Linux (x86_64) | `rajada-x86_64-unknown-linux-gnu` | `rajada` |
+| macOS (Apple Silicon) | `rajada-aarch64-apple-darwin` | `rajada` |
 
 ### Opção B — compilar no seu computador
 
 **Windows 10/11:** dê dois cliques em `compilar_windows.bat`.
 O script instala o que faltar (Rust via winget e Visual Studio Build Tools com a
-carga de trabalho C++), compila e gera `acelerador.exe` na mesma pasta.
+carga de trabalho C++), compila e gera `rajada.exe` na mesma pasta.
 Requisitos: winget (App Installer) e conexão com a internet. O Build Tools pode
 ocupar vários GB.
 
@@ -44,7 +44,7 @@ ocupar vários GB.
 ./compilar_linux.sh
 ```
 
-O script instala o Rust via rustup, se faltar, e gera o binário `acelerador`.
+O script instala o Rust via rustup, se faltar, e gera o binário `rajada`.
 
 ## Como usar
 
@@ -67,13 +67,13 @@ O botão **Pasta de logs**, no canto superior direito, abre a pasta onde ficam o
 
 Cada execução grava um arquivo de log com versão, sistema, início e fim de downloads,
 tentativas que falharam e pânicos com backtrace. Quando passa de 1 MB, o arquivo é
-renomeado para `acelerador.log.old`.
+renomeado para `rajada.log.old`.
 
 | Sistema | Local |
 |---|---|
-| Windows | `%LOCALAPPDATA%\AceleradorDownloads\logs\acelerador.log` |
-| macOS | `~/Library/Logs/AceleradorDownloads/acelerador.log` |
-| Linux | `~/.local/state/AceleradorDownloads/logs/acelerador.log` (ou `$XDG_STATE_HOME`) |
+| Windows | `%LOCALAPPDATA%\Rajada\logs\rajada.log` |
+| macOS | `~/Library/Logs/Rajada/rajada.log` |
+| Linux | `~/.local/state/Rajada/logs/rajada.log` (ou `$XDG_STATE_HOME`) |
 
 URLs são gravadas sem a query string, para não registrar tokens de links assinados.
 
@@ -87,8 +87,8 @@ A variável de ambiente `ACEL_TESTE` escolhe o renderizador gráfico:
 | `glow` | renderizador OpenGL |
 | `novsync` | wgpu sem sincronização vertical |
 
-- Windows (cmd): `set ACEL_TESTE=glow` e depois `acelerador.exe`
-- Linux/macOS: `ACEL_TESTE=glow ./acelerador`
+- Windows (cmd): `set ACEL_TESTE=glow` e depois `rajada.exe`
+- Linux/macOS: `ACEL_TESTE=glow ./rajada`
 
 ## Desenvolvimento
 

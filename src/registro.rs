@@ -2,8 +2,8 @@
 //!
 //! No Windows, o executável de release não tem console, então erros
 //! e pânicos não apareceriam em lugar nenhum. Este módulo grava tudo em:
-//!   %LOCALAPPDATA%\AceleradorDownloads\logs\acelerador.log
-//! Quando o arquivo passa de 1 MB, ele é renomeado para acelerador.log.old.
+//!   %LOCALAPPDATA%\Rajada\logs\rajada.log
+//! Quando o arquivo passa de 1 MB, ele é renomeado para rajada.log.old.
 
 use std::fs::{self, OpenOptions};
 use std::io::Write;
@@ -24,27 +24,27 @@ fn pasta_home() -> PathBuf {
 }
 
 /// Pasta de logs por sistema operacional:
-///   Windows: %LOCALAPPDATA%\AceleradorDownloads\logs
-///   macOS:   ~/Library/Logs/AceleradorDownloads
-///   Linux:   $XDG_STATE_HOME/AceleradorDownloads/logs (ou ~/.local/state/...)
+///   Windows: %LOCALAPPDATA%\Rajada\logs
+///   macOS:   ~/Library/Logs/Rajada
+///   Linux:   $XDG_STATE_HOME/Rajada/logs (ou ~/.local/state/...)
 fn pasta_de_logs() -> PathBuf {
     #[cfg(target_os = "windows")]
     {
         let base = std::env::var_os("LOCALAPPDATA")
             .map(PathBuf::from)
             .unwrap_or_else(pasta_home);
-        base.join("AceleradorDownloads").join("logs")
+        base.join("Rajada").join("logs")
     }
     #[cfg(target_os = "macos")]
     {
-        pasta_home().join("Library").join("Logs").join("AceleradorDownloads")
+        pasta_home().join("Library").join("Logs").join("Rajada")
     }
     #[cfg(not(any(target_os = "windows", target_os = "macos")))]
     {
         let base = std::env::var_os("XDG_STATE_HOME")
             .map(PathBuf::from)
             .unwrap_or_else(|| pasta_home().join(".local").join("state"));
-        base.join("AceleradorDownloads").join("logs")
+        base.join("Rajada").join("logs")
     }
 }
 
@@ -53,7 +53,7 @@ fn pasta_de_logs() -> PathBuf {
 pub fn iniciar() -> PathBuf {
     let pasta = pasta_de_logs();
     let _ = fs::create_dir_all(&pasta);
-    let caminho = pasta.join("acelerador.log");
+    let caminho = pasta.join("rajada.log");
     let _ = CAMINHO.set(caminho.clone());
 
     std::panic::set_hook(Box::new(|info| {

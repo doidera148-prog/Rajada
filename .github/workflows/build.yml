@@ -13,13 +13,13 @@ jobs:
         include:
           - os: windows-latest
             target: x86_64-pc-windows-msvc
-            binario: acelerador.exe
+            binario: rajada.exe
           - os: ubuntu-latest
             target: x86_64-unknown-linux-gnu
-            binario: acelerador
+            binario: rajada
           - os: macos-latest
             target: aarch64-apple-darwin
-            binario: acelerador
+            binario: rajada
 
     runs-on: ${{ matrix.os }}
     steps:
@@ -39,5 +39,5 @@ jobs:
       - name: Publicar binário
         uses: actions/upload-artifact@v4
         with:
-          name: acelerador-${{ matrix.target }}
+          name: rajada-${{ matrix.target }}
           path: target/${{ matrix.target }}/release/${{ matrix.binario }}

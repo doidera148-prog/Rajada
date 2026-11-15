@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
-# Compila o acelerador no Linux ou macOS.
+# Compila a Rajada no Linux ou macOS.
 # Instala o Rust (rustup) se faltar, compila em release e copia o binário
-# "acelerador" para esta pasta.
+# "rajada" para esta pasta.
 set -euo pipefail
 cd "$(dirname "$0")"
 
@@ -24,5 +24,5 @@ echo "=== 2/3 Compilando (as dependências são baixadas automaticamente) ==="
 cargo build --release
 
 echo "=== 3/3 Copiando binário ==="
-cp target/release/acelerador ./acelerador
-echo "PRONTO: $(pwd)/acelerador"
+cp target/release/rajada ./rajada
+echo "PRONTO: $(pwd)/rajada"

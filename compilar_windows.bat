@@ -1,6 +1,6 @@
 @echo off
 rem ============================================================
-rem  Compila acelerador.exe no Windows 10/11.
+rem  Compila rajada.exe no Windows 10/11.
 rem  Instala automaticamente o que faltar:
 rem    1) Rust (rustup/cargo) via winget
 rem    2) Visual Studio Build Tools com C++ via winget
@@ -8,7 +8,7 @@ rem  Depois baixa as dependencias do projeto (crates) e compila.
 rem  Requer winget (App Installer), presente no Windows 10 1809+ atualizado.
 rem ============================================================
 setlocal
-title Compilar acelerador.exe
+title Compilar rajada.exe
 cd /d "%~dp0"
 
 set "CARGO_BIN=%USERPROFILE%\.cargo\bin"
@@ -50,12 +50,12 @@ cargo build --release
 if errorlevel 1 goto erro_build
 
 echo.
-echo === 4/4 Copiando acelerador.exe para esta pasta ===
-copy /Y "target\release\acelerador.exe" "acelerador.exe" >nul
+echo === 4/4 Copiando rajada.exe para esta pasta ===
+copy /Y "target\release\rajada.exe" "rajada.exe" >nul
 if errorlevel 1 goto erro_build
 
 echo.
-echo PRONTO: %CD%\acelerador.exe
+echo PRONTO: %CD%\rajada.exe
 goto fim
 
 :erro_rust_winget

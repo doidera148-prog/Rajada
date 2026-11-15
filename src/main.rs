@@ -1,4 +1,4 @@
-//! Acelerador de downloads — interface gráfica (egui).
+//! Rajada — interface gráfica (egui).
 //! No Windows, a versão de release não abre a janela de console.
 #![cfg_attr(all(target_os = "windows", not(debug_assertions)), windows_subsystem = "windows")]
 
@@ -287,7 +287,7 @@ impl App {
     /// Cabeçalho: título e atalho para a pasta de logs.
     fn desenhar_cabecalho(&mut self, ui: &mut egui::Ui) {
         ui.horizontal(|ui| {
-            ui.heading("Acelerador de Downloads");
+            ui.heading("Rajada");
             ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
                 if ui
                     .small_button("Pasta de logs")
@@ -492,7 +492,7 @@ fn main() -> eframe::Result<()> {
     registro::registrar(
         "INFO",
         format!(
-            "Iniciando acelerador v{} | SO={} arch={} | ACEL_TESTE='{}' | log={}",
+            "Iniciando Rajada v{} | SO={} arch={} | ACEL_TESTE='{}' | log={}",
             env!("CARGO_PKG_VERSION"),
             std::env::consts::OS,
             std::env::consts::ARCH,
@@ -516,14 +516,14 @@ fn main() -> eframe::Result<()> {
         viewport: egui::ViewportBuilder::default()
             .with_inner_size([680.0, 560.0])
             .with_min_inner_size([560.0, 460.0])
-            .with_title("Acelerador de Downloads"),
+            .with_title("Rajada"),
         renderer,
         wgpu_options,
         ..Default::default()
     };
 
     let resultado = eframe::run_native(
-        "Acelerador de Downloads",
+        "Rajada",
         opcoes,
         Box::new(|_cc| Ok(Box::new(App::default()))),
     );
@@ -532,7 +532,7 @@ fn main() -> eframe::Result<()> {
     if let Err(erro) = &resultado {
         registro::registrar("ERROR", format!("Falha ao abrir a janela: {erro}"));
         let _ = rfd::MessageDialog::new()
-            .set_title("Acelerador de Downloads")
+            .set_title("Rajada")
             .set_description(format!(
                 "Não foi possível abrir a janela.\n\n{erro}\n\nDetalhes em:\n{}",
                 caminho_log.display()

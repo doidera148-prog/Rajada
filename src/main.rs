@@ -11,7 +11,7 @@ mod registro;
 
 use config::Preferencias;
 use eframe::egui::{self, Color32, RichText, ViewportCommand};
-use engine::{Config, Ctl, ErroDl, formatar_bytes, formatar_tempo, nome_da_url};
+use engine::{Config, Ctl, ErroDl, formatar_bytes, formatar_tempo, nome_da_url, sha_valido};
 use std::collections::VecDeque;
 use std::path::{Path, PathBuf};
 use std::sync::atomic::Ordering;
@@ -63,12 +63,20 @@ struct App {
     limite_kbps: u64,
     /// Última pasta usada para salvar.
     pasta: Option<String>,
+    /// Campos avançados (opcionais).
+    sha256: String,
+    referer: String,
+    cookie: String,
+    /// URLs esperando a vez, baixadas uma após a outra.
+    fila: VecDeque<String>,
 
     em_andamento: bool,
     ctl: Option<Ctl>,
     rx: Option<Receiver<Evento>>,
     /// Fecha a janela assim que o download cancelado terminar.
     fechar_ao_terminar: bool,
+    /// Começa o próximo item da fila quando o atual termina.
+    avancar_fila: bool,
     /// (instante, bytes baixados) para calcular a velocidade recente.
     amostras: VecDeque<(Instant, u64)>,
 
@@ -90,10 +98,15 @@ impl App {
             conexoes: prefs.conexoes,
             limite_kbps: prefs.limite_kbps,
             pasta: prefs.pasta,
+            sha256: String::new(),
+            referer: String::new(),
+            cookie: String::new(),
+            fila: VecDeque::new(),
             em_andamento: false,
             ctl: None,
             rx: None,
             fechar_ao_terminar: false,
+            avancar_fila: false,
             amostras: VecDeque::new(),
             progresso: 0.0,
             indeterminado: false,
@@ -146,6 +159,10 @@ impl App {
         if !(url.starts_with("http://") || url.starts_with("https://")) {
             return Some("A URL deve começar com http:// ou https://.".into());
         }
+        let sha = self.sha256.trim();
+        if !sha.is_empty() && !sha_valido(sha) {
+            return Some("O SHA-256 deve ter 64 caracteres hexadecimais (ou ficar vazio).".into());
+        }
         None
     }
 
@@ -166,16 +183,26 @@ impl App {
         }
     }
 
+    fn mostrar_erro(&mut self, texto: String) {
+        self.dialogo = Dialogo::Mensagem {
+            titulo: "Dados inválidos".into(),
+            texto,
+        };
+    }
+
     /// Valida, e pergunta antes de substituir um arquivo que já existe.
     fn pedir_inicio(&mut self) {
         if self.em_andamento {
             return;
         }
+        // Sem URL no campo, começa o primeiro item da fila.
+        if self.url.trim().is_empty()
+            && let Some(proxima) = self.fila.pop_front()
+        {
+            self.url = proxima;
+        }
         if let Some(erro) = self.validar() {
-            self.dialogo = Dialogo::Mensagem {
-                titulo: "Dados inválidos".into(),
-                texto: erro,
-            };
+            self.mostrar_erro(erro);
             return;
         }
         let destino = self.destino_efetivo();
@@ -184,6 +211,29 @@ impl App {
             return;
         }
         self.iniciar_agora();
+    }
+
+    /// Adiciona a URL do campo à fila e limpa o campo.
+    fn adicionar_fila(&mut self) {
+        if let Some(erro) = self.validar() {
+            self.mostrar_erro(erro);
+            return;
+        }
+        let url = self.url.trim().to_string();
+        self.registrar(format!("Adicionado à fila: {url}"));
+        self.fila.push_back(url);
+        self.url.clear();
+    }
+
+    fn cabecalhos(&self) -> Vec<(String, String)> {
+        let mut cabs = Vec::new();
+        if !self.referer.trim().is_empty() {
+            cabs.push(("Referer".to_string(), self.referer.trim().to_string()));
+        }
+        if !self.cookie.trim().is_empty() {
+            cabs.push(("Cookie".to_string(), self.cookie.trim().to_string()));
+        }
+        cabs
     }
 
     fn iniciar_agora(&mut self) {
@@ -205,11 +255,14 @@ impl App {
             );
         }
 
+        let sha = self.sha256.trim();
         let cfg = Config {
             url: url.clone(),
             destino: destino.clone(),
             conexoes: self.conexoes.max(1),
             limite_kbps: self.limite_kbps,
+            sha256: (!sha.is_empty()).then(|| sha.to_string()),
+            cabecalhos: self.cabecalhos(),
         };
         let ctl = Ctl::default();
         let (tx, rx) = mpsc::channel::<Evento>();
@@ -292,10 +345,13 @@ impl App {
                         "INFO",
                         format!("Interface: download concluido em {caminho}"),
                     );
-                    self.dialogo = Dialogo::Mensagem {
-                        titulo: "Concluído".into(),
-                        texto: format!("Download concluído:\n{caminho}"),
-                    };
+                    if self.fila.is_empty() {
+                        self.dialogo = Dialogo::Mensagem {
+                            titulo: "Concluído".into(),
+                            texto: format!("Download concluído:\n{caminho}"),
+                        };
+                    }
+                    self.avancar_fila = true;
                 }
                 Evento::Falhou(msg) => {
                     self.finalizar();
@@ -303,10 +359,14 @@ impl App {
                     self.status_cor = Some(COR_ERRO);
                     self.registrar(format!("ERRO: {msg}"));
                     registro::registrar("ERROR", format!("Interface: download falhou: {msg}"));
-                    self.dialogo = Dialogo::Mensagem {
-                        titulo: "Erro no download".into(),
-                        texto: msg,
-                    };
+                    if self.fila.is_empty() {
+                        self.dialogo = Dialogo::Mensagem {
+                            titulo: "Erro no download".into(),
+                            texto: msg,
+                        };
+                    }
+                    // Um erro não para a fila: o próximo item começa.
+                    self.avancar_fila = true;
                 }
                 Evento::Cancelado => {
                     self.finalizar();
@@ -315,10 +375,29 @@ impl App {
                     self.status_cor = Some(COR_AVISO);
                     self.registrar("Download cancelado.".into());
                     registro::registrar("INFO", "Interface: download cancelado pelo usuario");
+                    // Cancelar interrompe a fila também.
+                    if !self.fila.is_empty() {
+                        self.registrar(format!("Fila cancelada ({} itens).", self.fila.len()));
+                        self.fila.clear();
+                    }
+                    self.avancar_fila = false;
                 }
             }
             if self.fechar_ao_terminar {
                 ctx.send_viewport_cmd(ViewportCommand::Close);
+            }
+        }
+
+        if self.avancar_fila && !self.fechar_ao_terminar && !self.em_andamento {
+            self.avancar_fila = false;
+            if let Some(proxima) = self.fila.pop_front() {
+                self.url = proxima;
+                self.destino.clear();
+                if let Some(erro) = self.validar() {
+                    self.registrar(format!("Item da fila ignorado: {erro}"));
+                } else {
+                    self.iniciar_agora();
+                }
             }
         }
     }
@@ -481,6 +560,42 @@ impl App {
                 )
                 .on_hover_text("0 = sem limite de velocidade.");
             });
+
+            egui::CollapsingHeader::new("Avançado (opcional)")
+                .default_open(false)
+                .show(ui, |ui| {
+                    egui::Grid::new("grade_avancado")
+                        .num_columns(2)
+                        .spacing([10.0, 6.0])
+                        .show(ui, |ui| {
+                            ui.label("SHA-256");
+                            ui.add_enabled(
+                                !self.em_andamento,
+                                egui::TextEdit::singleline(&mut self.sha256)
+                                    .desired_width(f32::INFINITY)
+                                    .hint_text("64 caracteres; confere o arquivo ao final"),
+                            );
+                            ui.end_row();
+
+                            ui.label("Referer");
+                            ui.add_enabled(
+                                !self.em_andamento,
+                                egui::TextEdit::singleline(&mut self.referer)
+                                    .desired_width(f32::INFINITY)
+                                    .hint_text("Página de origem, se o site exigir"),
+                            );
+                            ui.end_row();
+
+                            ui.label("Cookie");
+                            ui.add_enabled(
+                                !self.em_andamento,
+                                egui::TextEdit::singleline(&mut self.cookie)
+                                    .desired_width(f32::INFINITY)
+                                    .hint_text("nome=valor; outro=valor"),
+                            );
+                            ui.end_row();
+                        });
+                });
         });
     }
 
@@ -502,6 +617,7 @@ impl App {
                     self.em_andamento,
                     egui::Button::new("Cancelar").min_size(tamanho),
                 )
+                .on_hover_text("Atalho: Esc")
                 .clicked()
             {
                 self.cancelar();
@@ -511,6 +627,25 @@ impl App {
                 && let Some(pasta) = arquivo.parent()
             {
                 abrir_pasta(pasta);
+            }
+        });
+
+        ui.horizontal(|ui| {
+            if ui
+                .add_enabled(
+                    !self.url.trim().is_empty(),
+                    egui::Button::new("Adicionar à fila"),
+                )
+                .on_hover_text("Guarda esta URL para baixar depois, uma após a outra")
+                .clicked()
+            {
+                self.adicionar_fila();
+            }
+            if !self.fila.is_empty() {
+                ui.label(format!("Fila: {} item(ns)", self.fila.len()));
+                if ui.small_button("Limpar fila").clicked() {
+                    self.fila.clear();
+                }
             }
         });
     }
@@ -653,6 +788,14 @@ impl eframe::App for App {
             }
         }
 
+        // Esc cancela o download em andamento (só quando nenhum diálogo está aberto).
+        if self.em_andamento
+            && matches!(self.dialogo, Dialogo::Nenhum)
+            && ctx.input(|i| i.key_pressed(egui::Key::Escape))
+        {
+            self.cancelar();
+        }
+
         self.processar_eventos(ctx);
         if self.em_andamento {
             self.atualizar_progresso();
@@ -719,8 +862,8 @@ fn main() -> eframe::Result<()> {
 
     let opcoes = eframe::NativeOptions {
         viewport: egui::ViewportBuilder::default()
-            .with_inner_size([680.0, 560.0])
-            .with_min_inner_size([560.0, 460.0])
+            .with_inner_size([680.0, 620.0])
+            .with_min_inner_size([560.0, 480.0])
             .with_title("Rajada"),
         renderer,
         wgpu_options,

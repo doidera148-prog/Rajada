@@ -2,7 +2,7 @@
 
 | Arquivo | Sistema | Versão |
 |---|---|---|
-| `rajada-linux-x86_64` | Linux (x86_64) | 0.2.0 |
+| `rajada-linux-x86_64` | Linux (x86_64) | 0.3.0 |
 | `rajada-windows-x86_64.exe` | Windows 10/11 (64 bits) | 0.1.0 (anterior) |
 | `rajada-macos-arm64` | macOS (Apple Silicon) | 0.1.0 (anterior, será removido) |
 

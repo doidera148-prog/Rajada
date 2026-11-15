@@ -1,8 +1,10 @@
 //! Motor de download: baixa o arquivo em segmentos paralelos (HTTP Range),
 //! grava tudo direto em `destino.part` e só renomeia ao final. Mantém um
 //! arquivo de estado com os segmentos já prontos, para retomar depois de
-//! cancelamento ou queda. Aplica limite de velocidade. Não depende da interface.
+//! cancelamento ou queda. Aplica limite de velocidade, verifica SHA-256 e
+//! envia cabeçalhos personalizados. Não depende da interface.
 
+use sha2::{Digest, Sha256};
 use std::fmt;
 use std::fs::{self, File, OpenOptions};
 use std::io::{self, Read, Write};
@@ -12,7 +14,7 @@ use std::sync::{Arc, Mutex, MutexGuard};
 use std::thread;
 use std::time::{Duration, Instant};
 
-/// Tamanho dos blocos de leitura da rede.
+/// Tamanho dos blocos de leitura da rede e de leitura de arquivos.
 const CHUNK: usize = 256 * 1024;
 /// Limites do tamanho de cada segmento. Segmentos pequenos permitem salvar
 /// progresso com frequência; grandes demais desperdiçariam dados ao cancelar.
@@ -20,6 +22,8 @@ const SEG_MIN: u64 = 256 * 1024;
 const SEG_MAX: u64 = 8 * 1024 * 1024;
 /// Quantas vezes cada segmento é tentado antes de desistir.
 const TENTATIVAS: u32 = 5;
+/// Quantas vezes o `rename` final é repetido (antivírus pode segurar o arquivo).
+const TENTATIVAS_RENAME: u32 = 10;
 const TIMEOUT: Duration = Duration::from_secs(15);
 const AGENTE: &str = concat!("Rajada/", env!("CARGO_PKG_VERSION"));
 const VERSAO_ESTADO: &str = "1";
@@ -49,11 +53,11 @@ fn limpar(msg: &str, url: &str) -> String {
 pub enum ErroDl {
     /// O usuário cancelou.
     Cancelado,
-    /// Falha que não adianta repetir (por exemplo, 404 ou erro de disco).
+    /// Falha que não adianta repetir (por exemplo, 404, espaço ou SHA-256 errado).
     Permanente(String),
     /// Falha temporária: o motor tenta de novo.
     Outro(String),
-    /// O arquivo mudou no servidor desde o início; o download parcial foi descartado.
+    /// O arquivo mudou no servidor, ou o servidor respondeu com partes que não batem.
     Mudou,
 }
 
@@ -64,7 +68,8 @@ impl fmt::Display for ErroDl {
             ErroDl::Permanente(m) | ErroDl::Outro(m) => write!(f, "{m}"),
             ErroDl::Mudou => write!(
                 f,
-                "o arquivo mudou no servidor desde o início; o parcial foi descartado. Inicie de novo."
+                "o arquivo mudou no servidor (ou o servidor respondeu partes inconsistentes); \
+                 o parcial foi descartado. Inicie de novo."
             ),
         }
     }
@@ -98,6 +103,10 @@ pub struct Config {
     pub conexoes: u32,
     /// Limite em KB/s; 0 = sem limite.
     pub limite_kbps: u64,
+    /// SHA-256 esperado (64 caracteres hexadecimais), opcional.
+    pub sha256: Option<String>,
+    /// Cabeçalhos extras enviados em todas as requisições (ex.: Referer, Cookie).
+    pub cabecalhos: Vec<(String, String)>,
 }
 
 /// Estado compartilhado entre a interface e o motor.
@@ -160,6 +169,21 @@ fn dormir_cancelavel(total: Duration, ctl: &Ctl) {
         thread::sleep(passo);
         restante -= passo;
     }
+}
+
+/// Dados de uma requisição de download, compartilhados pelas conexões.
+/// `agent` é clonado por conexão (ele é barato de clonar).
+#[derive(Clone)]
+struct Ctx<'a> {
+    agent: ureq::Agent,
+    url: &'a str,
+    /// ETag (ou Last-Modified) para If-Range; vazio se não houver.
+    validador: &'a str,
+    cabecalhos: &'a [(String, String)],
+    /// Tamanho total do arquivo; 0 quando não é conhecido.
+    tamanho: u64,
+    ctl: &'a Ctl,
+    limitador: &'a Limitador,
 }
 
 // ---------------------------------------------------------------------------
@@ -306,6 +330,87 @@ fn escrever_em(arq: &File, mut buf: &[u8], mut pos: u64) -> io::Result<()> {
     Ok(())
 }
 
+/// Renomeia com novas tentativas: no Windows, antivírus ou indexador pode
+/// estar com o arquivo aberto por um instante.
+fn renomear_com_tentativas(de: &Path, para: &Path) -> io::Result<()> {
+    let mut ultimo = None;
+    for tentativa in 1..=TENTATIVAS_RENAME {
+        match fs::rename(de, para) {
+            Ok(()) => return Ok(()),
+            Err(e) => {
+                ultimo = Some(e);
+                thread::sleep(Duration::from_millis(200 * u64::from(tentativa)));
+            }
+        }
+    }
+    Err(ultimo.unwrap_or_else(|| io::Error::other("falha ao renomear")))
+}
+
+/// Confere se há espaço livre para `necessario` bytes na pasta do destino.
+/// Se não for possível medir o espaço, não bloqueia o download.
+fn verificar_espaco(destino: &Path, necessario: u64) -> Res<()> {
+    let pasta = destino
+        .parent()
+        .filter(|p| !p.as_os_str().is_empty())
+        .unwrap_or(Path::new("."));
+    match fs2::available_space(pasta) {
+        Ok(disponivel) if disponivel < necessario => Err(ErroDl::Permanente(format!(
+            "espaço insuficiente: precisa de {} e há {} livres",
+            formatar_bytes(necessario as f64),
+            formatar_bytes(disponivel as f64)
+        ))),
+        _ => Ok(()),
+    }
+}
+
+/// Marca o arquivo como vindo da internet (Windows), para o sistema avisar antes de abrir.
+#[cfg(windows)]
+fn marcar_origem_web(caminho: &Path) {
+    let mut s = caminho.as_os_str().to_os_string();
+    s.push(":Zone.Identifier");
+    let _ = fs::write(PathBuf::from(s), "[ZoneTransfer]\r\nZoneId=3\r\n");
+}
+
+#[cfg(not(windows))]
+fn marcar_origem_web(_caminho: &Path) {}
+
+/// Confere se o texto é um SHA-256 válido (64 caracteres hexadecimais).
+pub fn sha_valido(texto: &str) -> bool {
+    let t = texto.trim();
+    t.len() == 64 && t.chars().all(|c| c.is_ascii_hexdigit())
+}
+
+fn sha256_arquivo(caminho: &Path) -> io::Result<String> {
+    let mut arq = File::open(caminho)?;
+    let mut hasher = Sha256::new();
+    let mut buf = vec![0u8; CHUNK];
+    loop {
+        let n = arq.read(&mut buf)?;
+        if n == 0 {
+            break;
+        }
+        hasher.update(&buf[..n]);
+    }
+    Ok(format!("{:x}", hasher.finalize()))
+}
+
+/// Interpreta `Content-Range: bytes a-b/total`.
+fn parse_content_range(v: &str) -> Option<(u64, u64, u64)> {
+    let resto = v.trim().strip_prefix("bytes ")?;
+    let (intervalo, total) = resto.split_once('/')?;
+    let (a, b) = intervalo.split_once('-')?;
+    Some((
+        a.trim().parse().ok()?,
+        b.trim().parse().ok()?,
+        total.trim().parse().ok()?,
+    ))
+}
+
+/// Aplica os cabeçalhos personalizados a uma requisição.
+fn com_cabecalhos(req: ureq::Request, cabecalhos: &[(String, String)]) -> ureq::Request {
+    cabecalhos.iter().fold(req, |r, (k, v)| r.set(k, v))
+}
+
 // ---------------------------------------------------------------------------
 // Download
 // ---------------------------------------------------------------------------
@@ -321,6 +426,14 @@ pub fn executar(cfg: &Config, ctl: &Ctl, log: &(dyn Fn(String) + Sync)) -> Res<(
 }
 
 fn executar_interno(cfg: &Config, ctl: &Ctl, log: &(dyn Fn(String) + Sync)) -> Res<()> {
+    if let Some(esperado) = &cfg.sha256
+        && !sha_valido(esperado)
+    {
+        return Err(ErroDl::Permanente(
+            "SHA-256 inválido: informe 64 caracteres hexadecimais".into(),
+        ));
+    }
+
     let agent = ureq::AgentBuilder::new()
         .timeout_connect(TIMEOUT)
         .timeout_read(TIMEOUT)
@@ -343,7 +456,7 @@ fn executar_interno(cfg: &Config, ctl: &Ctl, log: &(dyn Fn(String) + Sync)) -> R
     }
 
     log(format!("Consultando servidor: {}", redigir(&cfg.url)));
-    let sonda = sondar(&agent, &cfg.url)?;
+    let sonda = sondar(&agent, &cfg.url, &cfg.cabecalhos)?;
     crate::registro::registrar(
         "INFO",
         format!(
@@ -368,24 +481,37 @@ fn executar_interno(cfg: &Config, ctl: &Ctl, log: &(dyn Fn(String) + Sync)) -> R
                 cfg.conexoes
             ));
             crate::registro::registrar("INFO", "Modo segmentado");
-            baixar_segmentado(
-                &agent,
-                &sonda.url_final,
-                &sonda.validador,
-                t,
-                cfg,
+            let ctx = Ctx {
+                agent,
+                url: &sonda.url_final,
+                validador: &sonda.validador,
+                cabecalhos: &cfg.cabecalhos,
+                tamanho: t,
                 ctl,
-                &limitador,
-            )?;
+                limitador: &limitador,
+            };
+            baixar_segmentado(cfg, &ctx)?;
         }
-        _ => {
-            let motivo = match sonda.tamanho {
+        tamanho => {
+            let motivo = match tamanho {
                 Some(_) => "servidor sem Range",
                 None => "tamanho desconhecido",
             };
             log(format!("Usando download simples ({motivo})."));
             crate::registro::registrar("INFO", format!("Modo simples: {motivo}"));
-            baixar_simples(&agent, &sonda.url_final, &cfg.destino, ctl, &limitador)?;
+            if let Some(t) = tamanho {
+                verificar_espaco(&cfg.destino, t)?;
+            }
+            let ctx = Ctx {
+                agent,
+                url: &sonda.url_final,
+                validador: "",
+                cabecalhos: &cfg.cabecalhos,
+                tamanho: tamanho.unwrap_or(0),
+                ctl,
+                limitador: &limitador,
+            };
+            baixar_simples(&ctx, &cfg.destino)?;
         }
     }
 
@@ -397,6 +523,20 @@ fn executar_interno(cfg: &Config, ctl: &Ctl, log: &(dyn Fn(String) + Sync)) -> R
             "tamanho final {final_bytes} difere do esperado {t}"
         )));
     }
+
+    if let Some(esperado) = &cfg.sha256 {
+        log("Conferindo SHA-256…".into());
+        let obtido = sha256_arquivo(&cfg.destino)?;
+        if !obtido.eq_ignore_ascii_case(esperado.trim()) {
+            return Err(ErroDl::Permanente(format!(
+                "SHA-256 não confere (esperado {esperado}, obtido {obtido}). \
+                 O arquivo foi mantido, mas pode estar corrompido."
+            )));
+        }
+        crate::registro::registrar("INFO", "SHA-256 confere");
+    }
+
+    marcar_origem_web(&cfg.destino);
     crate::registro::registrar(
         "INFO",
         format!(
@@ -430,11 +570,11 @@ fn validador_de(r: &ureq::Response) -> String {
 }
 
 /// Descobre tamanho, suporte a Range, URL final (após redirecionamentos) e validador.
-fn sondar(agent: &ureq::Agent, url: &str) -> Res<Sonda> {
+fn sondar(agent: &ureq::Agent, url: &str, cabecalhos: &[(String, String)]) -> Res<Sonda> {
     let mut tamanho_head = None;
     let mut url_head = None;
     let mut validador_head = String::new();
-    match agent.head(url).call() {
+    match com_cabecalhos(agent.head(url), cabecalhos).call() {
         Ok(r) => {
             tamanho_head = r
                 .header("Content-Length")
@@ -467,7 +607,9 @@ fn sondar(agent: &ureq::Agent, url: &str) -> Res<Sonda> {
 
     // Plano B: GET com Range 0-0. Alguns servidores não anunciam Accept-Ranges
     // mas aceitam Range; por isso testamos de fato.
-    let r = agent.get(url).set("Range", "bytes=0-0").call()?;
+    let r = com_cabecalhos(agent.get(url), cabecalhos)
+        .set("Range", "bytes=0-0")
+        .call()?;
     let url_final = r.get_url().to_string();
     let validador = if validador_head.is_empty() {
         validador_de(&r)
@@ -478,8 +620,8 @@ fn sondar(agent: &ureq::Agent, url: &str) -> Res<Sonda> {
         206 => {
             let total = r
                 .header("Content-Range")
-                .and_then(|v| v.rsplit('/').next())
-                .and_then(|s| s.parse::<u64>().ok());
+                .and_then(parse_content_range)
+                .map(|(_, _, t)| t);
             Ok(Sonda {
                 tamanho: total.or(tamanho_head),
                 range: true,
@@ -499,24 +641,21 @@ fn sondar(agent: &ureq::Agent, url: &str) -> Res<Sonda> {
 
 /// Download segmentado e retomável. Os bytes vão direto para `destino.part`
 /// e o estado é salvo a cada segmento concluído.
-fn baixar_segmentado(
-    agent: &ureq::Agent,
-    url: &str,
-    validador: &str,
-    tamanho: u64,
-    cfg: &Config,
-    ctl: &Ctl,
-    limitador: &Limitador,
-) -> Res<()> {
+fn baixar_segmentado(cfg: &Config, ctx: &Ctx) -> Res<()> {
+    let tamanho = ctx.tamanho;
     let parcial = caminho_parcial(&cfg.destino);
     let arquivo_estado = caminho_estado(&cfg.destino);
 
     let retomado = carregar_estado(&arquivo_estado).filter(|e| {
-        e.url == url
+        e.url == ctx.url
             && e.tamanho == tamanho
-            && e.validador == validador
+            && e.validador == ctx.validador
             && fs::metadata(&parcial).is_ok_and(|m| m.len() == tamanho)
     });
+    // Só precisa de espaço para o que ainda falta.
+    let ja_feito = retomado.as_ref().map_or(0, Estado::bytes_feitos);
+    verificar_espaco(&cfg.destino, tamanho - ja_feito)?;
+
     let estado = match retomado {
         Some(e) => {
             let prontos = e.feitos.iter().filter(|&&f| f).count();
@@ -533,15 +672,17 @@ fn baixar_segmentado(
             let _ = fs::remove_file(&arquivo_estado);
             File::create(&parcial)?.set_len(tamanho)?;
             Estado::nova(
-                url,
+                ctx.url,
                 tamanho,
-                validador,
+                ctx.validador,
                 tamanho_segmento(tamanho, cfg.conexoes),
             )
         }
     };
 
-    ctl.baixado.store(estado.bytes_feitos(), Ordering::Relaxed);
+    ctx.ctl
+        .baixado
+        .store(estado.bytes_feitos(), Ordering::Relaxed);
     let pendentes: Vec<usize> = estado
         .feitos
         .iter()
@@ -569,9 +710,9 @@ fn baixar_segmentado(
         thread::scope(|s| {
             let mut handles = Vec::new();
             for _ in 0..n_threads {
-                let ag = agent.clone();
+                let mine = ctx.clone();
                 let c = &comp;
-                handles.push(s.spawn(move || trabalhador(c, &ag, url, validador, ctl, limitador)));
+                handles.push(s.spawn(move || trabalhador(c, &mine)));
             }
             for h in handles {
                 if h.join().is_err() {
@@ -582,7 +723,7 @@ fn baixar_segmentado(
         });
 
         let erros = trava(&comp.erros).clone();
-        if ctl.cancelado() {
+        if ctx.ctl.cancelado() {
             Err(ErroDl::Cancelado)
         } else if comp.mudou.load(Ordering::Relaxed) {
             Err(ErroDl::Mudou)
@@ -610,7 +751,7 @@ fn baixar_segmentado(
     if fs::metadata(&parcial)?.len() != tamanho {
         return Err(ErroDl::Outro("tamanho do arquivo parcial incorreto".into()));
     }
-    fs::rename(&parcial, &cfg.destino)?;
+    renomear_com_tentativas(&parcial, &cfg.destino)?;
     let _ = fs::remove_file(&arquivo_estado);
     Ok(())
 }
@@ -630,16 +771,9 @@ struct Compartilhado<'a> {
 }
 
 /// Cada conexão pega segmentos pendentes até acabarem, cancelarem ou o arquivo mudar.
-fn trabalhador(
-    c: &Compartilhado,
-    agent: &ureq::Agent,
-    url: &str,
-    validador: &str,
-    ctl: &Ctl,
-    limitador: &Limitador,
-) {
+fn trabalhador(c: &Compartilhado, ctx: &Ctx) {
     loop {
-        if ctl.cancelado() || c.mudou.load(Ordering::Relaxed) {
+        if ctx.ctl.cancelado() || c.mudou.load(Ordering::Relaxed) {
             return;
         }
         let k = c.proximo.fetch_add(1, Ordering::Relaxed);
@@ -647,8 +781,15 @@ fn trabalhador(
             return;
         };
         let (ini, fim) = intervalo(i, c.seg, c.tamanho);
-        match baixar_segmento(agent, url, validador, c.arq, ini, fim, ctl, limitador) {
+        match baixar_segmento(ctx, c.arq, ini, fim) {
             Ok(()) => {
+                // Os bytes precisam estar no disco antes de o estado dizer que estão prontos.
+                if let Err(e) = c.arq.sync_data() {
+                    let msg = format!("erro ao gravar no disco: {e}");
+                    crate::registro::registrar("ERROR", format!("parte {} falhou: {msg}", i + 1));
+                    trava(&c.erros).push(format!("parte {}: {msg}", i + 1));
+                    continue;
+                }
                 let mut estado = trava(&c.estado);
                 estado.feitos[i] = true;
                 if let Err(e) = salvar_estado(&c.estado_path, &estado) {
@@ -664,7 +805,7 @@ fn trabalhador(
                 return;
             }
             Err(e) => {
-                let msg = limpar(&e.to_string(), url);
+                let msg = limpar(&e.to_string(), ctx.url);
                 crate::registro::registrar("ERROR", format!("parte {} falhou: {msg}", i + 1));
                 trava(&c.erros).push(format!("parte {}: {msg}", i + 1));
             }
@@ -674,36 +815,16 @@ fn trabalhador(
 
 /// Baixa bytes [ini, fim] com retentativas. Cada tentativa regrava o segmento
 /// inteiro na posição certa, então uma tentativa interrompida não corrompe nada.
-#[allow(clippy::too_many_arguments)]
-fn baixar_segmento(
-    agent: &ureq::Agent,
-    url: &str,
-    validador: &str,
-    arq: &File,
-    ini: u64,
-    fim: u64,
-    ctl: &Ctl,
-    limitador: &Limitador,
-) -> Res<()> {
+fn baixar_segmento(ctx: &Ctx, arq: &File, ini: u64, fim: u64) -> Res<()> {
     for tentativa in 1..=TENTATIVAS {
-        if ctl.cancelado() {
+        if ctx.ctl.cancelado() {
             return Err(ErroDl::Cancelado);
         }
         let mut escritos = 0u64;
-        let resultado = tentar_segmento(
-            agent,
-            url,
-            validador,
-            arq,
-            ini,
-            fim,
-            ctl,
-            limitador,
-            &mut escritos,
-        );
+        let resultado = tentar_segmento(ctx, arq, ini, fim, &mut escritos);
         // Bytes de uma tentativa que falhou não contam como progresso.
         if resultado.is_err() {
-            ctl.baixado.fetch_sub(escritos, Ordering::Relaxed);
+            ctx.ctl.baixado.fetch_sub(escritos, Ordering::Relaxed);
         }
         match resultado {
             Ok(()) => return Ok(()),
@@ -714,7 +835,7 @@ fn baixar_segmento(
                         "tentativa {tentativa}/{TENTATIVAS} falhou: {m}; nova tentativa em breve"
                     ),
                 );
-                dormir_cancelavel(Duration::from_secs(1u64 << tentativa.min(4)), ctl);
+                dormir_cancelavel(Duration::from_secs(1u64 << tentativa.min(4)), ctx.ctl);
             }
             Err(ErroDl::Outro(m)) => {
                 return Err(ErroDl::Outro(format!(
@@ -727,27 +848,31 @@ fn baixar_segmento(
     Err(ErroDl::Outro("sem resultado".into()))
 }
 
-#[allow(clippy::too_many_arguments)]
-fn tentar_segmento(
-    agent: &ureq::Agent,
-    url: &str,
-    validador: &str,
-    arq: &File,
-    ini: u64,
-    fim: u64,
-    ctl: &Ctl,
-    limitador: &Limitador,
-    escritos: &mut u64,
-) -> Res<()> {
-    let mut req = agent.get(url).set("Range", &format!("bytes={ini}-{fim}"));
-    if !validador.is_empty() {
+fn tentar_segmento(ctx: &Ctx, arq: &File, ini: u64, fim: u64, escritos: &mut u64) -> Res<()> {
+    let mut req = com_cabecalhos(ctx.agent.get(ctx.url), ctx.cabecalhos)
+        .set("Range", &format!("bytes={ini}-{fim}"));
+    if !ctx.validador.is_empty() {
         // Se o arquivo mudou, o servidor responde com o arquivo inteiro (200).
-        req = req.set("If-Range", validador);
+        req = req.set("If-Range", ctx.validador);
     }
     let resp = req.call()?;
     match resp.status() {
-        206 => {}
-        200 if !validador.is_empty() => return Err(ErroDl::Mudou),
+        206 => {
+            // Alguns servidores ignoram If-Range: confere se a parte é a pedida.
+            let (inicio_resp, total_resp) =
+                match resp.header("Content-Range").and_then(parse_content_range) {
+                    Some((a, _, t)) => (a, t),
+                    None => {
+                        return Err(ErroDl::Permanente(
+                            "resposta 206 sem Content-Range válido".into(),
+                        ));
+                    }
+                };
+            if inicio_resp != ini || (ctx.tamanho > 0 && total_resp != ctx.tamanho) {
+                return Err(ErroDl::Mudou);
+            }
+        }
+        200 if !ctx.validador.is_empty() => return Err(ErroDl::Mudou),
         200 => {
             return Err(ErroDl::Permanente(
                 "o servidor ignorou o pedido de parte (sem Range)".into(),
@@ -760,7 +885,7 @@ fn tentar_segmento(
     let mut buf = vec![0u8; CHUNK];
     let mut pos = ini;
     while pos <= fim {
-        if ctl.cancelado() {
+        if ctx.ctl.cancelado() {
             return Err(ErroDl::Cancelado);
         }
         let n = leitor.read(&mut buf)?;
@@ -774,8 +899,8 @@ fn tentar_segmento(
             .map_err(|e| ErroDl::Permanente(format!("erro ao gravar no disco: {e}")))?;
         pos += n as u64;
         *escritos += n as u64;
-        limitador.aguardar(n, ctl);
-        ctl.baixado.fetch_add(n as u64, Ordering::Relaxed);
+        ctx.limitador.aguardar(n, ctx.ctl);
+        ctx.ctl.baixado.fetch_add(n as u64, Ordering::Relaxed);
     }
 
     if pos != fim + 1 {
@@ -790,37 +915,25 @@ fn tentar_segmento(
 
 /// Download sem Range: um único GET, gravado em `destino.part`.
 /// Não é retomável; se falhar ou for cancelado, o parcial é apagado.
-fn baixar_simples(
-    agent: &ureq::Agent,
-    url: &str,
-    destino: &Path,
-    ctl: &Ctl,
-    limitador: &Limitador,
-) -> Res<()> {
+fn baixar_simples(ctx: &Ctx, destino: &Path) -> Res<()> {
     let parcial = caminho_parcial(destino);
-    let resultado = gravar_simples(agent, url, &parcial, ctl, limitador);
+    let resultado = gravar_simples(ctx, &parcial);
     if resultado.is_err() {
         let _ = fs::remove_file(&parcial);
         return resultado;
     }
-    fs::rename(&parcial, destino)?;
+    renomear_com_tentativas(&parcial, destino)?;
     Ok(())
 }
 
-fn gravar_simples(
-    agent: &ureq::Agent,
-    url: &str,
-    parcial: &Path,
-    ctl: &Ctl,
-    limitador: &Limitador,
-) -> Res<()> {
-    let resp = agent.get(url).call()?;
+fn gravar_simples(ctx: &Ctx, parcial: &Path) -> Res<()> {
+    let resp = com_cabecalhos(ctx.agent.get(ctx.url), ctx.cabecalhos).call()?;
     let mut leitor = resp.into_reader();
     let mut arq = File::create(parcial)?;
     let mut buf = vec![0u8; CHUNK];
-    ctl.baixado.store(0, Ordering::Relaxed);
+    ctx.ctl.baixado.store(0, Ordering::Relaxed);
     loop {
-        if ctl.cancelado() {
+        if ctx.ctl.cancelado() {
             return Err(ErroDl::Cancelado);
         }
         let n = leitor.read(&mut buf)?;
@@ -828,10 +941,10 @@ fn gravar_simples(
             break;
         }
         arq.write_all(&buf[..n])?;
-        limitador.aguardar(n, ctl);
-        ctl.baixado.fetch_add(n as u64, Ordering::Relaxed);
+        ctx.limitador.aguardar(n, ctx.ctl);
+        ctx.ctl.baixado.fetch_add(n as u64, Ordering::Relaxed);
     }
-    arq.flush()?;
+    arq.sync_all()?;
     Ok(())
 }
 
@@ -932,6 +1045,10 @@ mod tests {
     struct Conteudo {
         dados: Arc<Vec<u8>>,
         etag: String,
+        /// Responde 403 se o cabeçalho `x-rajada-teste: sim` não vier.
+        exige_cabecalho: bool,
+        /// Informa um Content-Range que começa um byte depois do pedido.
+        range_deslocado: bool,
     }
 
     /// Servidor HTTP mínimo para testes. Retorna a URL do arquivo.
@@ -964,6 +1081,7 @@ mod tests {
 
         let mut range_pedido: Option<String> = None;
         let mut if_range: Option<String> = None;
+        let mut teste_ok = false;
         loop {
             let mut h = String::new();
             if leitor.read_line(&mut h).unwrap_or(0) == 0 {
@@ -974,9 +1092,11 @@ mod tests {
                 break;
             }
             if let Some((k, v)) = h.split_once(':') {
+                let v = v.trim();
                 match k.trim().to_ascii_lowercase().as_str() {
-                    "range" => range_pedido = Some(v.trim().to_string()),
-                    "if-range" => if_range = Some(v.trim().to_string()),
+                    "range" => range_pedido = Some(v.to_string()),
+                    "if-range" => if_range = Some(v.to_string()),
+                    "x-rajada-teste" => teste_ok = v == "sim",
                     _ => {}
                 }
             }
@@ -986,6 +1106,10 @@ mod tests {
         let tam = snap.dados.len();
         if caminho.contains("404") {
             responder(&mut stream, "404 Not Found", "", &[]);
+            return;
+        }
+        if snap.exige_cabecalho && !teste_ok {
+            responder(&mut stream, "403 Forbidden", "", &[]);
             return;
         }
         let comuns = format!(
@@ -1022,8 +1146,9 @@ mod tests {
         match pedido {
             Some((ini, fim)) if range && if_range_ok => {
                 let corpo = &snap.dados[ini..=fim];
+                let inicio_informado = if snap.range_deslocado { ini + 1 } else { ini };
                 let cab = format!(
-                    "Content-Length: {}\r\nContent-Range: bytes {ini}-{fim}/{tam}\r\n{comuns}",
+                    "Content-Length: {}\r\nContent-Range: bytes {inicio_informado}-{fim}/{tam}\r\n{comuns}",
                     corpo.len()
                 );
                 responder(&mut stream, "206 Partial Content", &cab, corpo);
@@ -1050,6 +1175,8 @@ mod tests {
         Arc::new(Mutex::new(Conteudo {
             dados,
             etag: etag.to_string(),
+            exige_cabecalho: false,
+            range_deslocado: false,
         }))
     }
 
@@ -1079,6 +1206,8 @@ mod tests {
             destino,
             conexoes,
             limite_kbps: limite,
+            sha256: None,
+            cabecalhos: Vec::new(),
         }
     }
 
@@ -1178,9 +1307,81 @@ mod tests {
         *conteudo.lock().unwrap() = Conteudo {
             dados: Arc::clone(&dados_v2),
             etag: "\"v2\"".into(),
+            exige_cabecalho: false,
+            range_deslocado: false,
         };
         executar(&cfg(url, destino.clone(), 8, 0), &Ctl::default(), &nao_loga).unwrap();
         assert_eq!(fs::read(&destino).unwrap(), *dados_v2, "conteúdo misturado");
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn content_range_inconsistente_e_detectado() {
+        // Servidor que ignora If-Range e responde com outro deslocamento.
+        let dados = dados_de_teste(1_000_000);
+        let conteudo = conteudo_de(Arc::clone(&dados), "\"v1\"");
+        conteudo.lock().unwrap().range_deslocado = true;
+        let url = servidor(conteudo, true);
+        let dir = pasta_tmp("content_range");
+        let destino = dir.join("saida.bin");
+        let res = executar(&cfg(url, destino.clone(), 4, 0), &Ctl::default(), &nao_loga);
+        assert!(matches!(res, Err(ErroDl::Mudou)), "esperava Mudou: {res:?}");
+        assert!(
+            !destino.exists(),
+            "não deve entregar arquivo com partes trocadas"
+        );
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn sha256_confere_e_detecta_erro() {
+        let dados = dados_de_teste(200_000);
+        let url = servidor(conteudo_de(Arc::clone(&dados), "\"v1\""), true);
+        let dir = pasta_tmp("sha");
+        let dest = dir.join("ok.bin");
+        let esperado = format!("{:x}", Sha256::digest(dados.as_slice()));
+
+        let mut c = cfg(url.clone(), dest.clone(), 2, 0);
+        c.sha256 = Some(esperado.clone());
+        executar(&c, &Ctl::default(), &nao_loga).unwrap();
+
+        let mut ruim = cfg(url, dir.join("ruim.bin"), 2, 0);
+        ruim.sha256 = Some("0".repeat(64));
+        let res = executar(&ruim, &Ctl::default(), &nao_loga);
+        assert!(
+            matches!(res, Err(ErroDl::Permanente(_))),
+            "esperava erro de SHA: {res:?}"
+        );
+
+        let mut invalido = cfg("http://127.0.0.1:1/x".into(), dir.join("x.bin"), 1, 0);
+        invalido.sha256 = Some("abc".into());
+        assert!(matches!(
+            executar(&invalido, &Ctl::default(), &nao_loga),
+            Err(ErroDl::Permanente(_))
+        ));
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn cabecalhos_personalizados_sao_enviados() {
+        let dados = dados_de_teste(50_000);
+        let conteudo = conteudo_de(Arc::clone(&dados), "\"v1\"");
+        conteudo.lock().unwrap().exige_cabecalho = true;
+        let url = servidor(conteudo, true);
+        let dir = pasta_tmp("cabecalhos");
+
+        // Sem o cabeçalho, o servidor recusa.
+        let sem = executar(
+            &cfg(url.clone(), dir.join("sem.bin"), 2, 0),
+            &Ctl::default(),
+            &nao_loga,
+        );
+        assert!(sem.is_err());
+
+        let mut com = cfg(url, dir.join("com.bin"), 2, 0);
+        com.cabecalhos = vec![("x-rajada-teste".into(), "sim".into())];
+        executar(&com, &Ctl::default(), &nao_loga).unwrap();
+        assert_eq!(fs::read(dir.join("com.bin")).unwrap(), *dados);
         let _ = fs::remove_dir_all(&dir);
     }
 
@@ -1263,6 +1464,15 @@ mod tests {
     }
 
     #[test]
+    fn espaco_insuficiente_e_recusado_antes_de_comecar() {
+        let dir = pasta_tmp("espaco");
+        let res = verificar_espaco(&dir.join("x.bin"), u64::MAX / 2);
+        assert!(matches!(res, Err(ErroDl::Permanente(_))));
+        assert!(verificar_espaco(&dir.join("x.bin"), 1).is_ok());
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
     fn arquivo_pequeno_com_muitas_conexoes() {
         let dados = dados_de_teste(10_000);
         let url = servidor(conteudo_de(Arc::clone(&dados), "\"v1\""), true);
@@ -1308,6 +1518,15 @@ mod tests {
         assert_eq!(lido.bytes_feitos(), 300);
         // Estado inconsistente é descartado.
         assert!(Estado::de_texto("url=x\ntamanho=1000\nseg=300\nfeitos=1\n").is_none());
+    }
+
+    #[test]
+    fn content_range_e_sha_validos() {
+        assert_eq!(parse_content_range("bytes 0-99/1000"), Some((0, 99, 1000)));
+        assert_eq!(parse_content_range("bytes */1000"), None);
+        assert!(sha_valido(&"a".repeat(64)));
+        assert!(!sha_valido(&"g".repeat(64)));
+        assert!(!sha_valido("abc"));
     }
 
     #[test]

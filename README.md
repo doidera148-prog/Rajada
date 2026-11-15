@@ -25,6 +25,11 @@ conexões paralelas. Escrito em Rust, roda no **Windows**, **Linux** e **macOS**
 - **Preferências salvas:** conexões, limite e última pasta usada são lembrados.
 - **Registro de eventos (logs)** para diagnóstico de erros, com atalho na interface.
   URLs são gravadas sem credenciais e sem query string.
+- **Verificação de SHA-256** (opcional): confere o arquivo ao final e avisa se não bater.
+- **Cabeçalhos personalizados** (opcional): Referer e Cookie, para sites que exigem.
+- **Fila de downloads:** adicione várias URLs e elas são baixadas uma após a outra.
+- **Verificação de espaço em disco** antes de começar.
+- **Mark of the Web (Windows):** arquivos baixados são marcados como vindos da internet.
 - **Aviso visível** se a janela não puder ser aberta (Windows, sem console).
 
 ## Instalação
@@ -70,6 +75,13 @@ O script instala o Rust via rustup, se faltar, e gera o binário `rajada`.
 4. Ajuste o número de **conexões** e, se quiser, o **limite de velocidade** (0 = sem limite).
 5. Clique em **Iniciar**. Acompanhe a barra, a velocidade e o tempo restante.
 6. Quando terminar, use **Abrir pasta do arquivo** para ver o download.
+
+**Fila:** digite a URL e clique em **Adicionar à fila**. Repita para outras URLs e clique
+em **Iniciar** (com o campo URL vazio) para baixar uma após a outra. Um erro não para a fila;
+cancelar, sim.
+
+**Avançado:** em *Avançado (opcional)* você informa o SHA-256 esperado, o Referer e o Cookie.
+**Esc** cancela o download em andamento.
 
 **Retomar:** se o download for cancelado ou interrompido, inicie de novo com a mesma
 URL e o mesmo destino. O programa continua de onde parou. Downloads de servidores que
@@ -164,6 +176,8 @@ O motor não depende da interface, então pode ser reaproveitado em outro progra
 (por exemplo, uma versão de linha de comando).
 
 ## Limitações conhecidas
+
+- A fila é sequencial: não há downloads em paralelo entre itens nem histórico salvo.
 
 - Não suporta sites que geram o link de download via JavaScript ou exigem login por
   navegador.

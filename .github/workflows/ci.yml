@@ -2,6 +2,9 @@ name: CI
 
 on:
   push:
+    # Sem "branches", o GitHub só dispara para tags quando "tags" está definido.
+    branches:
+      - main
     # Commits que mexem só em dist/ não disparam o workflow (evita loop).
     paths-ignore:
       - 'dist/**'

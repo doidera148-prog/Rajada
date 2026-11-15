@@ -12,7 +12,10 @@ conexões paralelas. Escrito em Rust, roda no **Windows**, **Linux** e **macOS**
 - **Cancelamento** que responde mesmo com limites baixos.
 - **Fallback** para servidores que não aceitam Range: download simples, em uma conexão.
 - **Retentativas** automáticas em cada parte, com espera crescente.
-- **Registro de eventos (logs)** para diagnóstico de erros.
+- **Registro de eventos (logs)** para diagnóstico de erros, com atalho na interface.
+- **Status colorido:** verde para sucesso, vermelho para falha e laranja para cancelado.
+- **Abrir pasta do arquivo** logo depois de um download concluído.
+- **Aviso visível** se a janela não puder ser aberta (Windows, sem console).
 
 ## Instalação
 
@@ -51,11 +54,16 @@ O script instala o Rust via rustup, se faltar, e gera o binário `acelerador`.
    para a pasta *Downloads* com o nome original.
 4. Ajuste o número de **conexões** e, se quiser, o **limite de velocidade** (0 = sem limite).
 5. Clique em **Iniciar**. Acompanhe a barra, a velocidade e o tempo restante.
+6. Quando terminar, use **Abrir pasta do arquivo** para ver o download.
+
+No registro, o botão **Limpar** apaga as mensagens exibidas (o arquivo de log não é afetado).
 
 **Retomar:** se o download for cancelado ou interrompido, inicie de novo com a mesma
 URL e o mesmo destino. O programa continua de onde parou.
 
 ## Registro de eventos (logs)
+
+O botão **Pasta de logs**, no canto superior direito, abre a pasta onde ficam os logs.
 
 Cada execução grava um arquivo de log com versão, sistema, início e fim de downloads,
 tentativas que falharam e pânicos com backtrace. Quando passa de 1 MB, o arquivo é

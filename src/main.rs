@@ -5,11 +5,14 @@
     windows_subsystem = "windows"
 )]
 
+mod config;
 mod engine;
 mod registro;
 
-use eframe::egui::{self, Color32, RichText};
+use config::Preferencias;
+use eframe::egui::{self, Color32, RichText, ViewportCommand};
 use engine::{Config, Ctl, ErroDl, formatar_bytes, formatar_tempo, nome_da_url};
+use std::collections::VecDeque;
 use std::path::{Path, PathBuf};
 use std::sync::atomic::Ordering;
 use std::sync::mpsc::{self, Receiver, TryRecvError};
@@ -17,6 +20,8 @@ use std::thread;
 use std::time::{Duration, Instant};
 
 const MAX_REGISTRO: usize = 300;
+/// Janela usada para calcular a velocidade (média dos últimos segundos).
+const JANELA_VELOCIDADE: Duration = Duration::from_secs(4);
 
 const COR_SUCESSO: Color32 = Color32::from_rgb(46, 160, 67);
 const COR_ERRO: Color32 = Color32::from_rgb(218, 54, 51);
@@ -30,16 +35,42 @@ enum Evento {
     Cancelado,
 }
 
+/// Caixas de diálogo modais.
+enum Dialogo {
+    Nenhum,
+    Mensagem {
+        titulo: String,
+        texto: String,
+    },
+    /// O destino já existe e não há download parcial: confirmar substituição.
+    Substituir,
+    /// Fechar a janela com um download em andamento.
+    FecharComDownload,
+}
+
+/// Ação escolhida num diálogo, aplicada depois de desenhá-lo.
+enum Acao {
+    Fechar,
+    Substituir,
+    CancelarEFechar,
+    ContinuarBaixando,
+}
+
 struct App {
     url: String,
     destino: String,
     conexoes: u32,
     limite_kbps: u64,
+    /// Última pasta usada para salvar.
+    pasta: Option<String>,
 
     em_andamento: bool,
     ctl: Option<Ctl>,
     rx: Option<Receiver<Evento>>,
-    inicio: Instant,
+    /// Fecha a janela assim que o download cancelado terminar.
+    fechar_ao_terminar: bool,
+    /// (instante, bytes baixados) para calcular a velocidade recente.
+    amostras: VecDeque<(Instant, u64)>,
 
     progresso: f32,
     indeterminado: bool,
@@ -47,35 +78,40 @@ struct App {
     status_cor: Option<Color32>,
     detalhes: String,
     registro: Vec<String>,
-    popup: Option<(String, String)>,
+    dialogo: Dialogo,
     ultimo_sucesso: Option<PathBuf>,
 }
 
-impl Default for App {
-    fn default() -> Self {
+impl App {
+    fn com_preferencias(prefs: Preferencias) -> Self {
         Self {
             url: String::new(),
             destino: String::new(),
-            conexoes: 8,
-            limite_kbps: 0,
+            conexoes: prefs.conexoes,
+            limite_kbps: prefs.limite_kbps,
+            pasta: prefs.pasta,
             em_andamento: false,
             ctl: None,
             rx: None,
-            inicio: Instant::now(),
+            fechar_ao_terminar: false,
+            amostras: VecDeque::new(),
             progresso: 0.0,
             indeterminado: false,
             status: "Pronto para baixar.".into(),
             status_cor: None,
             detalhes: String::new(),
             registro: Vec::new(),
-            popup: None,
+            dialogo: Dialogo::Nenhum,
             ultimo_sucesso: None,
         }
     }
 }
 
-/// Pasta Downloads do usuário (Windows: %USERPROFILE%; demais: $HOME).
-fn pasta_padrao() -> PathBuf {
+/// Pasta para salvar: a última usada, se ainda existir; senão Downloads do usuário.
+fn pasta_padrao(preferida: Option<&str>) -> PathBuf {
+    if let Some(p) = preferida.map(PathBuf::from).filter(|p| p.is_dir()) {
+        return p;
+    }
     let home = std::env::var_os("USERPROFILE")
         .or_else(|| std::env::var_os("HOME"))
         .map(PathBuf::from)
@@ -113,6 +149,15 @@ impl App {
         None
     }
 
+    /// Destino efetivo: o campo, ou a pasta padrão com o nome vindo da URL.
+    fn destino_efetivo(&self) -> PathBuf {
+        if self.destino.trim().is_empty() {
+            pasta_padrao(self.pasta.as_deref()).join(nome_da_url(self.url.trim()))
+        } else {
+            PathBuf::from(self.destino.trim())
+        }
+    }
+
     fn registrar(&mut self, texto: String) {
         self.registro.push(texto);
         if self.registro.len() > MAX_REGISTRO {
@@ -121,22 +166,44 @@ impl App {
         }
     }
 
-    fn iniciar(&mut self) {
+    /// Valida, e pergunta antes de substituir um arquivo que já existe.
+    fn pedir_inicio(&mut self) {
         if self.em_andamento {
             return;
         }
         if let Some(erro) = self.validar() {
-            self.popup = Some(("Dados inválidos".into(), erro));
+            self.dialogo = Dialogo::Mensagem {
+                titulo: "Dados inválidos".into(),
+                texto: erro,
+            };
             return;
         }
+        let destino = self.destino_efetivo();
+        if destino.is_file() && !engine::tem_download_parcial(&destino) {
+            self.dialogo = Dialogo::Substituir;
+            return;
+        }
+        self.iniciar_agora();
+    }
 
+    fn iniciar_agora(&mut self) {
         let url = self.url.trim().to_string();
-        let destino = if self.destino.trim().is_empty() {
-            pasta_padrao().join(nome_da_url(&url))
-        } else {
-            PathBuf::from(self.destino.trim())
-        };
+        let destino = self.destino_efetivo();
         self.destino = destino.display().to_string();
+        self.pasta = destino.parent().map(|p| p.display().to_string());
+
+        // Guarda as preferências usadas nesta execução.
+        let prefs = Preferencias {
+            conexoes: self.conexoes,
+            limite_kbps: self.limite_kbps,
+            pasta: self.pasta.clone(),
+        };
+        if let Err(e) = config::salvar_em(&config::caminho_padrao(), &prefs) {
+            registro::registrar(
+                "WARN",
+                format!("não foi possível salvar as preferências: {e}"),
+            );
+        }
 
         let cfg = Config {
             url: url.clone(),
@@ -163,7 +230,7 @@ impl App {
             let evento = match resultado {
                 Ok(()) => Evento::Concluido(cfg.destino.display().to_string()),
                 Err(ErroDl::Cancelado) => Evento::Cancelado,
-                Err(ErroDl::Outro(msg)) => Evento::Falhou(msg),
+                Err(erro) => Evento::Falhou(erro.to_string()),
             };
             let _ = tx_thread.send(evento);
         });
@@ -176,9 +243,9 @@ impl App {
         self.status_cor = None;
         self.detalhes.clear();
         self.ultimo_sucesso = None;
+        self.amostras.clear();
         self.ctl = Some(ctl);
         self.rx = Some(rx);
-        self.inicio = Instant::now();
     }
 
     fn cancelar(&mut self) {
@@ -190,16 +257,26 @@ impl App {
     }
 
     /// Consome eventos da thread de download.
-    fn processar_eventos(&mut self) {
+    fn processar_eventos(&mut self, ctx: &egui::Context) {
         let mut eventos = Vec::new();
+        let mut desconectou = false;
         if let Some(rx) = &self.rx {
             loop {
                 match rx.try_recv() {
                     Ok(ev) => eventos.push(ev),
                     Err(TryRecvError::Empty) => break,
-                    Err(TryRecvError::Disconnected) => break,
+                    Err(TryRecvError::Disconnected) => {
+                        desconectou = true;
+                        break;
+                    }
                 }
             }
+        }
+        if desconectou && self.em_andamento && eventos.is_empty() {
+            // A thread terminou sem avisar: trata como falha em vez de travar a tela.
+            eventos.push(Evento::Falhou(
+                "a transferência terminou sem resultado".into(),
+            ));
         }
         for ev in eventos {
             match ev {
@@ -215,10 +292,10 @@ impl App {
                         "INFO",
                         format!("Interface: download concluido em {caminho}"),
                     );
-                    self.popup = Some((
-                        "Concluído".into(),
-                        format!("Download concluído:\n{caminho}"),
-                    ));
+                    self.dialogo = Dialogo::Mensagem {
+                        titulo: "Concluído".into(),
+                        texto: format!("Download concluído:\n{caminho}"),
+                    };
                 }
                 Evento::Falhou(msg) => {
                     self.finalizar();
@@ -226,16 +303,22 @@ impl App {
                     self.status_cor = Some(COR_ERRO);
                     self.registrar(format!("ERRO: {msg}"));
                     registro::registrar("ERROR", format!("Interface: download falhou: {msg}"));
-                    self.popup = Some(("Erro no download".into(), msg));
+                    self.dialogo = Dialogo::Mensagem {
+                        titulo: "Erro no download".into(),
+                        texto: msg,
+                    };
                 }
                 Evento::Cancelado => {
                     self.finalizar();
                     self.status =
-                        "Cancelado. As partes ficaram salvas; inicie de novo para retomar.".into();
+                        "Cancelado. Inicie de novo para retomar, se o servidor permitir.".into();
                     self.status_cor = Some(COR_AVISO);
                     self.registrar("Download cancelado.".into());
                     registro::registrar("INFO", "Interface: download cancelado pelo usuario");
                 }
+            }
+            if self.fechar_ao_terminar {
+                ctx.send_viewport_cmd(ViewportCommand::Close);
             }
         }
     }
@@ -251,33 +334,49 @@ impl App {
     /// Atualiza barra, velocidade e tempo restante a partir dos contadores atômicos.
     fn atualizar_progresso(&mut self) {
         let Some(ctl) = &self.ctl else { return };
-        let baixado = ctl.baixado.load(Ordering::Relaxed) as f64;
-        let total = ctl.total.load(Ordering::Relaxed) as f64;
-        let decorrido = self.inicio.elapsed().as_secs_f64().max(1e-6);
-        let velocidade = baixado / decorrido;
+        let baixado = ctl.baixado.load(Ordering::Relaxed);
+        let total = ctl.total.load(Ordering::Relaxed);
 
-        if total > 0.0 {
+        // Velocidade pela média dos últimos segundos, sem contar bytes que já estavam no disco.
+        let agora = Instant::now();
+        self.amostras.push_back((agora, baixado));
+        while self.amostras.len() > 2
+            && self
+                .amostras
+                .front()
+                .is_some_and(|(t, _)| agora.duration_since(*t) > JANELA_VELOCIDADE)
+        {
+            self.amostras.pop_front();
+        }
+        let velocidade = match (self.amostras.front(), self.amostras.back()) {
+            (Some(&(t0, b0)), Some(&(t1, b1))) if t1 > t0 => {
+                (b1 - b0) as f64 / (t1 - t0).as_secs_f64()
+            }
+            _ => 0.0,
+        };
+
+        if total > 0 {
             self.indeterminado = false;
-            self.progresso = (baixado / total).clamp(0.0, 1.0) as f32;
+            self.progresso = (baixado as f64 / total as f64).clamp(0.0, 1.0) as f32;
             let restante = if velocidade > 0.0 {
-                (total - baixado) / velocidade
+                (total - baixado.min(total)) as f64 / velocidade
             } else {
                 0.0
             };
             self.status = format!(
                 "{:.1}%  —  {} de {}",
                 self.progresso * 100.0,
-                formatar_bytes(baixado),
-                formatar_bytes(total)
+                formatar_bytes(baixado as f64),
+                formatar_bytes(total as f64)
             );
             self.detalhes = format!(
                 "Velocidade: {}/s   Tempo restante: {}",
                 formatar_bytes(velocidade),
                 formatar_tempo(restante)
             );
-        } else if baixado > 0.0 {
+        } else if baixado > 0 {
             self.indeterminado = true;
-            self.status = format!("Baixado: {}", formatar_bytes(baixado));
+            self.status = format!("Baixado: {}", formatar_bytes(baixado as f64));
             self.detalhes = format!("Velocidade: {}/s", formatar_bytes(velocidade));
         }
     }
@@ -289,10 +388,11 @@ impl App {
             nome_da_url(self.url.trim())
         };
         if let Some(caminho) = rfd::FileDialog::new()
-            .set_directory(pasta_padrao())
+            .set_directory(pasta_padrao(self.pasta.as_deref()))
             .set_file_name(&nome)
             .save_file()
         {
+            self.pasta = caminho.parent().map(|p| p.display().to_string());
             self.destino = caminho.display().to_string();
         }
     }
@@ -331,7 +431,7 @@ impl App {
                             .hint_text("https://exemplo.com/arquivo.zip"),
                     );
                     if resposta.lost_focus() && ui.input(|i| i.key_pressed(egui::Key::Enter)) {
-                        self.iniciar();
+                        self.pedir_inicio();
                     }
                     ui.end_row();
 
@@ -341,7 +441,7 @@ impl App {
                         ui.add(
                             egui::TextEdit::singleline(&mut self.destino)
                                 .desired_width(largura)
-                                .hint_text("Vazio = pasta Downloads, com o nome da URL"),
+                                .hint_text("Vazio = última pasta usada, com o nome da URL"),
                         );
                         if ui.button("Procurar…").clicked() {
                             self.escolher_destino();
@@ -349,6 +449,15 @@ impl App {
                     });
                     ui.end_row();
                 });
+            // Mostra o nome final que será usado, antes de iniciar.
+            if !self.url.trim().is_empty() && self.validar().is_none() {
+                let nome = self
+                    .destino_efetivo()
+                    .file_name()
+                    .map(|n| n.to_string_lossy().into_owned())
+                    .unwrap_or_default();
+                ui.label(RichText::new(format!("Arquivo: {nome}")).weak().small());
+            }
         });
     }
 
@@ -361,7 +470,9 @@ impl App {
                     !self.em_andamento,
                     egui::DragValue::new(&mut self.conexoes).range(1..=32),
                 )
-                .on_hover_text("Quantas partes baixar ao mesmo tempo (1 a 32).");
+                .on_hover_text(
+                    "Quantas partes baixar ao mesmo tempo (1 a 32). Fica salvo para a próxima vez.",
+                );
                 ui.add_space(24.0);
                 ui.label("Limite (KB/s)");
                 ui.add_enabled(
@@ -384,7 +495,7 @@ impl App {
                 )
                 .clicked()
             {
-                self.iniciar();
+                self.pedir_inicio();
             }
             if ui
                 .add_enabled(
@@ -450,12 +561,99 @@ impl App {
                 });
         });
     }
+
+    /// Diálogos modais. Devolve a ação escolhida, se houver.
+    fn desenhar_dialogo(&self, ctx: &egui::Context) -> Option<Acao> {
+        let mut acao = None;
+        match &self.dialogo {
+            Dialogo::Nenhum => {}
+            Dialogo::Mensagem { titulo, texto } => {
+                egui::Window::new(titulo.as_str())
+                    .collapsible(false)
+                    .resizable(false)
+                    .anchor(egui::Align2::CENTER_CENTER, [0.0, 0.0])
+                    .show(ctx, |ui| {
+                        ui.label(texto.as_str());
+                        ui.add_space(8.0);
+                        if ui.button("OK").clicked() {
+                            acao = Some(Acao::Fechar);
+                        }
+                    });
+            }
+            Dialogo::Substituir => {
+                egui::Window::new("Substituir arquivo?")
+                    .collapsible(false)
+                    .resizable(false)
+                    .anchor(egui::Align2::CENTER_CENTER, [0.0, 0.0])
+                    .show(ctx, |ui| {
+                        ui.label(format!(
+                            "Já existe um arquivo com este nome:\n{}\n\nSubstituir pelo novo download?",
+                            self.destino_efetivo().display()
+                        ));
+                        ui.add_space(8.0);
+                        ui.horizontal(|ui| {
+                            if ui.button("Substituir").clicked() {
+                                acao = Some(Acao::Substituir);
+                            }
+                            if ui.button("Cancelar").clicked() {
+                                acao = Some(Acao::Fechar);
+                            }
+                        });
+                    });
+            }
+            Dialogo::FecharComDownload => {
+                egui::Window::new("Download em andamento")
+                    .collapsible(false)
+                    .resizable(false)
+                    .anchor(egui::Align2::CENTER_CENTER, [0.0, 0.0])
+                    .show(ctx, |ui| {
+                        ui.label(
+                            "Há um download em andamento. As partes já baixadas ficam salvas\n\
+                             e você pode retomar depois.",
+                        );
+                        ui.add_space(8.0);
+                        ui.horizontal(|ui| {
+                            if ui.button("Cancelar download e fechar").clicked() {
+                                acao = Some(Acao::CancelarEFechar);
+                            }
+                            if ui.button("Continuar baixando").clicked() {
+                                acao = Some(Acao::ContinuarBaixando);
+                            }
+                        });
+                    });
+            }
+        }
+        acao
+    }
+
+    fn aplicar_acao(&mut self, acao: Acao) {
+        match acao {
+            Acao::Fechar | Acao::ContinuarBaixando => self.dialogo = Dialogo::Nenhum,
+            Acao::Substituir => {
+                self.dialogo = Dialogo::Nenhum;
+                self.iniciar_agora();
+            }
+            Acao::CancelarEFechar => {
+                self.dialogo = Dialogo::Nenhum;
+                self.fechar_ao_terminar = true;
+                self.cancelar();
+            }
+        }
+    }
 }
 
 impl eframe::App for App {
     /// Lógica sem desenho: consome eventos e atualiza o progresso.
     fn logic(&mut self, ctx: &egui::Context, _frame: &mut eframe::Frame) {
-        self.processar_eventos();
+        // Fechar a janela com download ativo pede confirmação antes.
+        if ctx.input(|i| i.viewport().close_requested()) && self.em_andamento {
+            ctx.send_viewport_cmd(ViewportCommand::CancelClose);
+            if !matches!(self.dialogo, Dialogo::FecharComDownload) {
+                self.dialogo = Dialogo::FecharComDownload;
+            }
+        }
+
+        self.processar_eventos(ctx);
         if self.em_andamento {
             self.atualizar_progresso();
             ctx.request_repaint_after(Duration::from_millis(100));
@@ -478,22 +676,9 @@ impl eframe::App for App {
             self.desenhar_registro(ui);
         });
 
-        if let Some((titulo, texto)) = &self.popup {
-            let mut fechar = false;
-            egui::Window::new(titulo.as_str())
-                .collapsible(false)
-                .resizable(false)
-                .anchor(egui::Align2::CENTER_CENTER, [0.0, 0.0])
-                .show(ui.ctx(), |ui| {
-                    ui.label(texto.as_str());
-                    ui.add_space(8.0);
-                    if ui.button("OK").clicked() {
-                        fechar = true;
-                    }
-                });
-            if fechar {
-                self.popup = None;
-            }
+        let ctx = ui.ctx().clone();
+        if let Some(acao) = self.desenhar_dialogo(&ctx) {
+            self.aplicar_acao(acao);
         }
     }
 }
@@ -519,6 +704,8 @@ fn main() -> eframe::Result<()> {
         ),
     );
 
+    let prefs = config::carregar_de(&config::caminho_padrao());
+
     let renderer = if teste == "glow" {
         eframe::Renderer::Glow
     } else {
@@ -543,7 +730,7 @@ fn main() -> eframe::Result<()> {
     let resultado = eframe::run_native(
         "Rajada",
         opcoes,
-        Box::new(|_cc| Ok(Box::new(App::default()))),
+        Box::new(move |_cc| Ok(Box::new(App::com_preferencias(prefs)))),
     );
 
     // No Windows, sem console, uma falha ao abrir a janela passaria despercebida.

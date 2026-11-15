@@ -1,33 +1,47 @@
 # Rajada
 
 Programa com interface gráfica que acelera downloads dividindo o arquivo em várias
-conexões paralelas. Escrito em Rust, roda no **Windows**, **Linux** e **macOS**.
+conexões paralelas. Escrito em Rust, roda no **Windows**, **Linux** e **macOS**
+(Apple Silicon e Intel).
 
 ## Recursos
 
 - **Downloads paralelos** usando HTTP Range, com de 1 a 32 conexões.
-- **Retomada automática:** partes já baixadas são aproveitadas se o download for
-  interrompido ou cancelado.
+- **Retomada segura:** cada segmento concluído é salvo em disco. Se o download for
+  cancelado ou interrompido, a retomada continua de onde parou, mesmo trocando o número
+  de conexões. Se o arquivo mudou no servidor (ETag ou data de modificação), ele é
+  baixado de novo, sem misturar versões.
+- **Gravação direta:** os dados vão para `arquivo.part` e só recebem o nome final ao
+  terminar, então um arquivo incompleto nunca parece pronto.
 - **Limite de velocidade** configurável em KB/s.
+- **Velocidade recente:** calculada sobre os últimos segundos, não sobre a média da
+  execução inteira.
 - **Cancelamento** que responde mesmo com limites baixos.
 - **Fallback** para servidores que não aceitam Range: download simples, em uma conexão.
-- **Retentativas** automáticas em cada parte, com espera crescente.
+- **Retentativas** automáticas em cada parte, com espera crescente. Erros que não
+  adianta repetir (como 404) falham na hora.
+- **Confirmações:** pergunta antes de substituir um arquivo existente, e antes de fechar
+  a janela com um download em andamento.
+- **Preferências salvas:** conexões, limite e última pasta usada são lembrados.
 - **Registro de eventos (logs)** para diagnóstico de erros, com atalho na interface.
-- **Status colorido:** verde para sucesso, vermelho para falha e laranja para cancelado.
-- **Abrir pasta do arquivo** logo depois de um download concluído.
+  URLs são gravadas sem credenciais e sem query string.
 - **Aviso visível** se a janela não puder ser aberta (Windows, sem console).
 
 ## Instalação
 
-### Opção A — baixar pronto (pasta `dist/`)
-A cada alteração enviada ao `main`, o workflow **Build** compila para os três sistemas
-e atualiza a pasta [`dist/`](dist/) com os binários prontos:
+### Opção A — baixar pronto
+
+**Pasta `dist/`:** a cada alteração enviada ao `main`, o workflow **CI** compila os
+binários e atualiza a pasta [`dist/`](dist/):
 
 | Sistema | Arquivo em `dist/` |
 |---|---|
 | Windows 10/11 | `rajada-windows-x86_64.exe` |
 | Linux (x86_64) | `rajada-linux-x86_64` |
-| macOS (Apple Silicon) | `rajada-macos-arm64` |
+| macOS (Apple Silicon e Intel) | `rajada-macos-universal` |
+
+**Releases:** cada tag `v*` cria uma release no GitHub, com os três binários e o arquivo
+`SHA256SUMS.txt` para conferir a integridade.
 
 Os binários também ficam disponíveis como artefatos na aba **Actions** de cada execução.
 
@@ -50,17 +64,26 @@ O script instala o Rust via rustup, se faltar, e gera o binário `rajada`.
 ## Como usar
 
 1. Abra o programa.
-2. Cole a URL do arquivo no campo **URL do arquivo**.
-3. Confira ou altere o caminho em **Salvar como**. Se ficar vazio, o arquivo vai
-   para a pasta *Downloads* com o nome original.
+2. Cole a URL do arquivo no campo **URL**.
+3. Confira o nome do arquivo logo abaixo do campo **Salvar em**. Se o campo ficar vazio,
+   o arquivo vai para a última pasta usada (ou *Downloads*) com o nome original.
 4. Ajuste o número de **conexões** e, se quiser, o **limite de velocidade** (0 = sem limite).
 5. Clique em **Iniciar**. Acompanhe a barra, a velocidade e o tempo restante.
 6. Quando terminar, use **Abrir pasta do arquivo** para ver o download.
 
+**Retomar:** se o download for cancelado ou interrompido, inicie de novo com a mesma
+URL e o mesmo destino. O programa continua de onde parou. Downloads de servidores que
+não aceitam Range recomeçam do zero.
+
 No registro, o botão **Limpar** apaga as mensagens exibidas (o arquivo de log não é afetado).
 
-**Retomar:** se o download for cancelado ou interrompido, inicie de novo com a mesma
-URL e o mesmo destino. O programa continua de onde parou.
+## Onde ficam as preferências
+
+| Sistema | Local |
+|---|---|
+| Windows | `%APPDATA%\Rajada\config.txt` |
+| macOS | `~/Library/Application Support/Rajada/config.txt` |
+| Linux | `~/.config/Rajada/config.txt` (ou `$XDG_CONFIG_HOME`) |
 
 ## Registro de eventos (logs)
 
@@ -75,8 +98,6 @@ renomeado para `rajada.log.old`.
 | Windows | `%LOCALAPPDATA%\Rajada\logs\rajada.log` |
 | macOS | `~/Library/Logs/Rajada/rajada.log` |
 | Linux | `~/.local/state/Rajada/logs/rajada.log` (ou `$XDG_STATE_HOME`) |
-
-URLs são gravadas sem a query string, para não registrar tokens de links assinados.
 
 ## Diagnóstico de janela lenta
 
@@ -93,12 +114,11 @@ A variável de ambiente `ACEL_TESTE` escolhe o renderizador gráfico:
 
 ## Diagnóstico automático
 
-O workflow **Diagnóstico e correção automática** (`.github/workflows/diagnostico.yml`)
-roda a cada push e em cada pull request:
+O workflow **CI** (`.github/workflows/ci.yml`) roda a cada push e em cada pull request:
 
 - **rustfmt:** verifica a formatação do código.
 - **clippy:** procura bugs prováveis e trechos que podem ser simplificados, tratando avisos como erro.
-- **Testes:** roda todos os testes.
+- **Testes:** roda todos os testes, em Windows, Linux e macOS.
 - **cargo-audit:** verifica vulnerabilidades conhecidas nas dependências.
 
 Em push para o `main`, o mesmo workflow também **aplica as correções mecânicas**
@@ -119,16 +139,24 @@ Elas não substituem a revisão de regras de negócio nem de comportamento da in
 
 ```bash
 cargo build --release   # gera o binário em target/release/
-cargo test --release    # roda os testes
+cargo test --all-targets
 ./diagnostico.sh        # diagnóstico completo (ver acima)
+```
+
+Para publicar uma versão, crie uma tag e envie:
+
+```bash
+git tag v0.2.0
+git push origin v0.2.0
 ```
 
 ### Estrutura
 
 ```
 src/
-├── main.rs       interface gráfica (egui)
-├── engine.rs     motor de download: partes, retomada, limite, cancelamento
+├── main.rs       interface gráfica (egui), diálogos e velocidade
+├── engine.rs     motor de download: segmentos, retomada, limite, cancelamento
+├── config.rs     preferências salvas em arquivo de texto
 └── registro.rs   registro de eventos em arquivo e captura de pânicos
 ```
 
@@ -141,6 +169,8 @@ O motor não depende da interface, então pode ser reaproveitado em outro progra
   navegador.
 - O ganho de velocidade depende do servidor aceitar HTTP Range e de a conexão ter
   banda suficiente para as conexões paralelas.
+- Os binários não são assinados digitalmente: o Windows pode mostrar aviso do
+  SmartScreen e o macOS pode pedir confirmação na primeira abertura.
 
 ## Licença
 

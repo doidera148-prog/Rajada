@@ -74,6 +74,11 @@ pub fn iniciar() -> PathBuf {
     caminho
 }
 
+/// Caminho do arquivo de log, se o registro já foi iniciado.
+pub fn caminho() -> Option<PathBuf> {
+    CAMINHO.get().cloned()
+}
+
 /// Acrescenta uma linha ao log. Não faz nada se `iniciar` não foi chamado (ex.: testes).
 pub fn registrar(nivel: &str, mensagem: impl AsRef<str>) {
     let Some(caminho) = CAMINHO.get() else {
@@ -99,8 +104,14 @@ mod tests {
     fn grava_linhas_e_pânico_no_arquivo() {
         let pasta = std::env::temp_dir().join(format!("acel_log_{}", std::process::id()));
         let _ = fs::remove_dir_all(&pasta);
-        // Aponta o registro para uma pasta temporária antes de iniciar.
-        unsafe { std::env::set_var("LOCALAPPDATA", &pasta) };
+        // Aponta todas as pastas de dados para a temporária, em qualquer sistema,
+        // para que o teste nunca escreva no log real do usuário.
+        unsafe {
+            std::env::set_var("LOCALAPPDATA", &pasta);
+            std::env::set_var("XDG_STATE_HOME", &pasta);
+            std::env::set_var("HOME", &pasta);
+            std::env::set_var("USERPROFILE", &pasta);
+        }
         let caminho = iniciar();
         registrar("INFO", "linha de teste");
         registrar("ERROR", "erro de teste");

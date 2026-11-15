@@ -5,15 +5,19 @@
 mod engine;
 mod registro;
 
-use eframe::egui;
+use eframe::egui::{self, Color32, RichText};
 use engine::{formatar_bytes, formatar_tempo, nome_da_url, Config, Ctl, ErroDl};
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::sync::atomic::Ordering;
 use std::sync::mpsc::{self, Receiver, TryRecvError};
 use std::thread;
 use std::time::{Duration, Instant};
 
 const MAX_REGISTRO: usize = 300;
+
+const COR_SUCESSO: Color32 = Color32::from_rgb(46, 160, 67);
+const COR_ERRO: Color32 = Color32::from_rgb(218, 54, 51);
+const COR_AVISO: Color32 = Color32::from_rgb(210, 140, 30);
 
 /// Mensagens enviadas da thread de download para a interface.
 enum Evento {
@@ -37,9 +41,11 @@ struct App {
     progresso: f32,
     indeterminado: bool,
     status: String,
+    status_cor: Option<Color32>,
     detalhes: String,
     registro: Vec<String>,
     popup: Option<(String, String)>,
+    ultimo_sucesso: Option<PathBuf>,
 }
 
 impl Default for App {
@@ -55,15 +61,17 @@ impl Default for App {
             inicio: Instant::now(),
             progresso: 0.0,
             indeterminado: false,
-            status: "Aguardando.".into(),
+            status: "Pronto para baixar.".into(),
+            status_cor: None,
             detalhes: String::new(),
             registro: Vec::new(),
             popup: None,
+            ultimo_sucesso: None,
         }
     }
 }
 
-/// Pasta Downloads do usuário (Windows: %USERPROFILE%; Linux: $HOME).
+/// Pasta Downloads do usuário (Windows: %USERPROFILE%; demais: $HOME).
 fn pasta_padrao() -> PathBuf {
     let home = std::env::var_os("USERPROFILE")
         .or_else(|| std::env::var_os("HOME"))
@@ -74,6 +82,20 @@ fn pasta_padrao() -> PathBuf {
         downloads
     } else {
         home
+    }
+}
+
+/// Abre uma pasta no gerenciador de arquivos do sistema.
+fn abrir_pasta(pasta: &Path) {
+    #[cfg(target_os = "windows")]
+    let mut comando = std::process::Command::new("explorer");
+    #[cfg(target_os = "macos")]
+    let mut comando = std::process::Command::new("open");
+    #[cfg(not(any(target_os = "windows", target_os = "macos")))]
+    let mut comando = std::process::Command::new("xdg-open");
+
+    if let Err(e) = comando.arg(pasta).spawn() {
+        registro::registrar("WARN", format!("Não foi possível abrir a pasta {}: {e}", pasta.display()));
     }
 }
 
@@ -149,7 +171,9 @@ impl App {
         self.indeterminado = true;
         self.progresso = 0.0;
         self.status = "Conectando…".into();
+        self.status_cor = None;
         self.detalhes.clear();
+        self.ultimo_sucesso = None;
         self.ctl = Some(ctl);
         self.rx = Some(rx);
         self.inicio = Instant::now();
@@ -181,14 +205,17 @@ impl App {
                 Evento::Concluido(caminho) => {
                     self.finalizar();
                     self.status = "Download concluído.".into();
+                    self.status_cor = Some(COR_SUCESSO);
                     self.progresso = 1.0;
+                    self.ultimo_sucesso = Some(PathBuf::from(&caminho));
                     self.registrar(format!("Salvo em: {caminho}"));
                     registro::registrar("INFO", format!("Interface: download concluido em {caminho}"));
                     self.popup = Some(("Concluído".into(), format!("Download concluído:\n{caminho}")));
                 }
                 Evento::Falhou(msg) => {
                     self.finalizar();
-                    self.status = "Falhou.".into();
+                    self.status = "Falhou. Veja os detalhes no registro.".into();
+                    self.status_cor = Some(COR_ERRO);
                     self.registrar(format!("ERRO: {msg}"));
                     registro::registrar("ERROR", format!("Interface: download falhou: {msg}"));
                     self.popup = Some(("Erro no download".into(), msg));
@@ -196,6 +223,7 @@ impl App {
                 Evento::Cancelado => {
                     self.finalizar();
                     self.status = "Cancelado. As partes ficaram salvas; inicie de novo para retomar.".into();
+                    self.status_cor = Some(COR_AVISO);
                     self.registrar("Download cancelado.".into());
                     registro::registrar("INFO", "Interface: download cancelado pelo usuario");
                 }
@@ -240,6 +268,172 @@ impl App {
             self.detalhes = format!("Velocidade: {}/s", formatar_bytes(velocidade));
         }
     }
+
+    fn escolher_destino(&mut self) {
+        let nome = if self.url.trim().is_empty() {
+            "download.bin".to_string()
+        } else {
+            nome_da_url(self.url.trim())
+        };
+        if let Some(caminho) = rfd::FileDialog::new()
+            .set_directory(pasta_padrao())
+            .set_file_name(&nome)
+            .save_file()
+        {
+            self.destino = caminho.display().to_string();
+        }
+    }
+
+    /// Cabeçalho: título e atalho para a pasta de logs.
+    fn desenhar_cabecalho(&mut self, ui: &mut egui::Ui) {
+        ui.horizontal(|ui| {
+            ui.heading("Acelerador de Downloads");
+            ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                if ui
+                    .small_button("Pasta de logs")
+                    .on_hover_text("Abre a pasta onde ficam os arquivos de log")
+                    .clicked()
+                    && let Some(log) = registro::caminho()
+                    && let Some(pasta) = log.parent()
+                {
+                    abrir_pasta(pasta);
+                }
+            });
+        });
+        ui.label(RichText::new("Baixa arquivos em várias conexões ao mesmo tempo.").weak());
+        ui.add_space(8.0);
+    }
+
+    /// Campos de URL e destino.
+    fn desenhar_entrada(&mut self, ui: &mut egui::Ui) {
+        egui::Frame::group(ui.style()).show(ui, |ui| {
+            egui::Grid::new("grade_entrada")
+                .num_columns(2)
+                .spacing([10.0, 8.0])
+                .show(ui, |ui| {
+                    ui.label("URL");
+                    let resposta = ui.add(
+                        egui::TextEdit::singleline(&mut self.url)
+                            .desired_width(f32::INFINITY)
+                            .hint_text("https://exemplo.com/arquivo.zip"),
+                    );
+                    if resposta.lost_focus() && ui.input(|i| i.key_pressed(egui::Key::Enter)) {
+                        self.iniciar();
+                    }
+                    ui.end_row();
+
+                    ui.label("Salvar em");
+                    ui.horizontal(|ui| {
+                        let largura = (ui.available_width() - 120.0).max(120.0);
+                        ui.add(
+                            egui::TextEdit::singleline(&mut self.destino)
+                                .desired_width(largura)
+                                .hint_text("Vazio = pasta Downloads, com o nome da URL"),
+                        );
+                        if ui.button("Procurar…").clicked() {
+                            self.escolher_destino();
+                        }
+                    });
+                    ui.end_row();
+                });
+        });
+    }
+
+    /// Conexões e limite de velocidade.
+    fn desenhar_opcoes(&mut self, ui: &mut egui::Ui) {
+        egui::Frame::group(ui.style()).show(ui, |ui| {
+            ui.horizontal(|ui| {
+                ui.label("Conexões");
+                ui.add_enabled(
+                    !self.em_andamento,
+                    egui::DragValue::new(&mut self.conexoes).range(1..=32),
+                )
+                .on_hover_text("Quantas partes baixar ao mesmo tempo (1 a 32).");
+                ui.add_space(24.0);
+                ui.label("Limite (KB/s)");
+                ui.add_enabled(
+                    !self.em_andamento,
+                    egui::DragValue::new(&mut self.limite_kbps).range(0..=10_000_000),
+                )
+                .on_hover_text("0 = sem limite de velocidade.");
+            });
+        });
+    }
+
+    /// Botões de ação.
+    fn desenhar_acoes(&mut self, ui: &mut egui::Ui) {
+        ui.horizontal(|ui| {
+            let tamanho = egui::vec2(120.0, 30.0);
+            if ui
+                .add_enabled(
+                    !self.em_andamento,
+                    egui::Button::new(RichText::new("Iniciar").strong()).min_size(tamanho),
+                )
+                .clicked()
+            {
+                self.iniciar();
+            }
+            if ui
+                .add_enabled(self.em_andamento, egui::Button::new("Cancelar").min_size(tamanho))
+                .clicked()
+            {
+                self.cancelar();
+            }
+            if let Some(arquivo) = self.ultimo_sucesso.clone()
+                && ui.button("Abrir pasta do arquivo").clicked()
+                && let Some(pasta) = arquivo.parent()
+            {
+                abrir_pasta(pasta);
+            }
+        });
+    }
+
+    /// Barra de progresso, status e detalhes.
+    fn desenhar_status(&mut self, ui: &mut egui::Ui) {
+        egui::Frame::group(ui.style()).show(ui, |ui| {
+            if self.indeterminado {
+                ui.add(egui::ProgressBar::new(0.0).animate(true));
+            } else {
+                ui.add(egui::ProgressBar::new(self.progresso).show_percentage());
+            }
+            let texto = RichText::new(&self.status).strong();
+            let texto = match self.status_cor {
+                Some(cor) => texto.color(cor),
+                None => texto,
+            };
+            ui.label(texto);
+            if !self.detalhes.is_empty() {
+                ui.label(RichText::new(&self.detalhes).weak());
+            }
+        });
+    }
+
+    /// Registro de eventos, com erros em destaque.
+    fn desenhar_registro(&mut self, ui: &mut egui::Ui) {
+        ui.horizontal(|ui| {
+            ui.label(RichText::new("Registro").strong());
+            ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                if ui.small_button("Limpar").clicked() {
+                    self.registro.clear();
+                }
+            });
+        });
+        egui::Frame::group(ui.style()).show(ui, |ui| {
+            egui::ScrollArea::vertical()
+                .stick_to_bottom(true)
+                .auto_shrink([false, false])
+                .show(ui, |ui| {
+                    for linha in &self.registro {
+                        let texto = RichText::new(linha).monospace().small();
+                        if linha.starts_with("ERRO") {
+                            ui.label(texto.color(COR_ERRO));
+                        } else {
+                            ui.label(texto);
+                        }
+                    }
+                });
+        });
+    }
 }
 
 impl eframe::App for App {
@@ -255,93 +449,17 @@ impl eframe::App for App {
     /// Desenho da janela.
     fn ui(&mut self, ui: &mut egui::Ui, _frame: &mut eframe::Frame) {
         egui::CentralPanel::default().show(ui, |ui| {
-            ui.heading("Acelerador de Downloads");
-            ui.add_space(6.0);
-
-            ui.horizontal(|ui| {
-                ui.label("URL do arquivo:");
-                let resp = ui.add(
-                    egui::TextEdit::singleline(&mut self.url)
-                        .desired_width(f32::INFINITY)
-                        .hint_text("https://exemplo.com/arquivo.zip"),
-                );
-                if resp.lost_focus() && ui.input(|i| i.key_pressed(egui::Key::Enter)) {
-                    self.iniciar();
-                }
-            });
-
-            ui.horizontal(|ui| {
-                ui.label("Salvar como:");
-                ui.add(egui::TextEdit::singleline(&mut self.destino).desired_width(f32::INFINITY));
-                if ui.button("Procurar…").clicked() {
-                    let nome = if self.url.trim().is_empty() {
-                        "download.bin".to_string()
-                    } else {
-                        nome_da_url(self.url.trim())
-                    };
-                    let inicial = pasta_padrao();
-                    if let Some(caminho) = rfd::FileDialog::new()
-                        .set_directory(&inicial)
-                        .set_file_name(&nome)
-                        .save_file()
-                    {
-                        self.destino = caminho.display().to_string();
-                    }
-                }
-            });
-
             ui.add_space(4.0);
-            ui.group(|ui| {
-                ui.horizontal(|ui| {
-                    ui.label("Conexões:");
-                    ui.add_enabled(
-                        !self.em_andamento,
-                        egui::DragValue::new(&mut self.conexoes).range(1..=32),
-                    );
-                    ui.add_space(20.0);
-                    ui.label("Limite (KB/s, 0 = sem limite):");
-                    ui.add_enabled(
-                        !self.em_andamento,
-                        egui::DragValue::new(&mut self.limite_kbps).range(0..=10_000_000),
-                    );
-                });
-            });
-
+            self.desenhar_cabecalho(ui);
+            self.desenhar_entrada(ui);
             ui.add_space(6.0);
-            ui.horizontal(|ui| {
-                if ui
-                    .add_enabled(!self.em_andamento, egui::Button::new("Iniciar"))
-                    .clicked()
-                {
-                    self.iniciar();
-                }
-                if ui
-                    .add_enabled(self.em_andamento, egui::Button::new("Cancelar"))
-                    .clicked()
-                {
-                    self.cancelar();
-                }
-            });
-
-            ui.separator();
-            if self.indeterminado {
-                ui.add(egui::ProgressBar::new(0.0).animate(true));
-            } else {
-                ui.add(egui::ProgressBar::new(self.progresso).show_percentage());
-            }
-            ui.label(&self.status);
-            ui.label(&self.detalhes);
-
-            ui.separator();
-            ui.label("Registro:");
-            egui::ScrollArea::vertical()
-                .stick_to_bottom(true)
-                .max_height(ui.available_height())
-                .show(ui, |ui| {
-                    for linha in &self.registro {
-                        ui.label(linha);
-                    }
-                });
+            self.desenhar_opcoes(ui);
+            ui.add_space(8.0);
+            self.desenhar_acoes(ui);
+            ui.add_space(8.0);
+            self.desenhar_status(ui);
+            ui.add_space(8.0);
+            self.desenhar_registro(ui);
         });
 
         if let Some((titulo, texto)) = &self.popup {
@@ -365,7 +483,7 @@ impl eframe::App for App {
 }
 
 fn main() -> eframe::Result<()> {
-    // Variável ACEL_TESTE, só para diagnosticar o arraste da janela no Windows:
+    // Variável ACEL_TESTE, para diagnosticar o arraste da janela:
     //   (vazio)  -> padrão (wgpu com VSync automático)
     //   glow     -> renderizador OpenGL
     //   novsync  -> wgpu sem sincronização vertical
@@ -396,16 +514,31 @@ fn main() -> eframe::Result<()> {
 
     let opcoes = eframe::NativeOptions {
         viewport: egui::ViewportBuilder::default()
-            .with_inner_size([680.0, 520.0])
-            .with_min_inner_size([560.0, 420.0])
+            .with_inner_size([680.0, 560.0])
+            .with_min_inner_size([560.0, 460.0])
             .with_title("Acelerador de Downloads"),
         renderer,
         wgpu_options,
         ..Default::default()
     };
-    eframe::run_native(
+
+    let resultado = eframe::run_native(
         "Acelerador de Downloads",
         opcoes,
         Box::new(|_cc| Ok(Box::new(App::default()))),
-    )
+    );
+
+    // No Windows, sem console, uma falha ao abrir a janela passaria despercebida.
+    if let Err(erro) = &resultado {
+        registro::registrar("ERROR", format!("Falha ao abrir a janela: {erro}"));
+        let _ = rfd::MessageDialog::new()
+            .set_title("Acelerador de Downloads")
+            .set_description(format!(
+                "Não foi possível abrir a janela.\n\n{erro}\n\nDetalhes em:\n{}",
+                caminho_log.display()
+            ))
+            .set_level(rfd::MessageLevel::Error)
+            .show();
+    }
+    resultado
 }

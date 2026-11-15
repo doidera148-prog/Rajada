@@ -135,7 +135,8 @@ jobs:
 
   # Só em push para o main: copia os binários para dist/ e faz commit.
   publicar:
-    if: github.event_name == 'push' && github.ref == 'refs/heads/main'
+    # Roda mesmo se um dos builds falhar: publica o que foi gerado.
+    if: ${{ !cancelled() && github.event_name == 'push' && github.ref == 'refs/heads/main' }}
     needs: [build, build-macos]
     runs-on: ubuntu-latest
     permissions:
@@ -153,10 +154,16 @@ jobs:
         shell: bash
         run: |
           mkdir -p dist
-          cp baixados/rajada-linux-x86_64 dist/
-          cp baixados/rajada-windows-x86_64.exe dist/
-          cp baixados/rajada-macos-universal dist/
-          chmod 755 dist/rajada-linux-x86_64 dist/rajada-macos-universal
+          ls -la baixados || true
+          for f in rajada-linux-x86_64 rajada-windows-x86_64.exe rajada-macos-universal; do
+            if [ -f "baixados/$f" ]; then
+              cp "baixados/$f" dist/
+              echo "copiado: $f"
+            else
+              echo "::warning::$f não foi gerado nesta execução (veja o job de build correspondente)"
+            fi
+          done
+          chmod 755 dist/rajada-linux-x86_64 dist/rajada-macos-universal 2>/dev/null || true
           # Versão antiga (só Apple Silicon), substituída pelo universal.
           git rm -f --ignore-unmatch dist/rajada-macos-arm64
 

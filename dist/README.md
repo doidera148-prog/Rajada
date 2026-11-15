@@ -6,8 +6,11 @@
 | `rajada-windows-x86_64.exe` | Windows 10/11 (64 bits) | `d39ab97` (nome antigo, interface anterior) |
 | `rajada-macos-arm64` | macOS (Apple Silicon) | `d39ab97` (nome antigo, interface anterior) |
 
-Os binários de Windows e macOS são da versão anterior: ainda mostram o nome antigo na janela.
-Serão substituídos quando o workflow **Build** gerar novos artefatos e eles forem colocados aqui.
+Esta pasta é atualizada automaticamente pelo workflow **Build** (`.github/workflows/build.yml`)
+a cada push para o `main` que altere o código. Não edite estes arquivos à mão.
+
+Os binários de Windows e macOS da tabela acima ainda são da versão anterior (commit `d39ab97`)
+e serão substituídos na próxima execução do workflow.
 
 ## Como usar
 

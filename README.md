@@ -19,16 +19,17 @@ conexões paralelas. Escrito em Rust, roda no **Windows**, **Linux** e **macOS**
 
 ## Instalação
 
-### Opção A — baixar pronto (GitHub Actions)
-A cada atualização do código, o workflow **Build** compila para os três sistemas.
-Abra a aba **Actions** do repositório, escolha a execução mais recente e baixe o
-artefato do seu sistema:
+### Opção A — baixar pronto (pasta `dist/`)
+A cada alteração enviada ao `main`, o workflow **Build** compila para os três sistemas
+e atualiza a pasta [`dist/`](dist/) com os binários prontos:
 
-| Sistema | Artefato | Arquivo |
-|---|---|---|
-| Windows 10/11 | `rajada-x86_64-pc-windows-msvc` | `rajada.exe` |
-| Linux (x86_64) | `rajada-x86_64-unknown-linux-gnu` | `rajada` |
-| macOS (Apple Silicon) | `rajada-aarch64-apple-darwin` | `rajada` |
+| Sistema | Arquivo em `dist/` |
+|---|---|
+| Windows 10/11 | `rajada-windows-x86_64.exe` |
+| Linux (x86_64) | `rajada-linux-x86_64` |
+| macOS (Apple Silicon) | `rajada-macos-arm64` |
+
+Os binários também ficam disponíveis como artefatos na aba **Actions** de cada execução.
 
 ### Opção B — compilar no seu computador
 

@@ -14,15 +14,21 @@ use eframe::egui::{self, Color32, RichText, ViewportCommand};
 use engine::{Config, Ctl, ErroDl, formatar_bytes, formatar_tempo, nome_da_url, sha_valido};
 use std::collections::VecDeque;
 use std::path::{Path, PathBuf};
+use std::sync::Arc;
 use std::sync::atomic::Ordering;
 use std::sync::mpsc::{self, Receiver, TryRecvError};
 use std::thread;
 use std::time::{Duration, Instant};
 
+/// Ícone em RGBA bruto (256 x 256), gerado a partir de assets/rajada.png.
+const ICONE_RGBA: &[u8] = include_bytes!("../assets/icone.rgba");
+const ICONE_LADO: usize = 256;
+
 const MAX_REGISTRO: usize = 300;
 /// Janela usada para calcular a velocidade (média dos últimos segundos).
 const JANELA_VELOCIDADE: Duration = Duration::from_secs(4);
 
+const ACENTO: Color32 = Color32::from_rgb(24, 120, 255);
 const COR_SUCESSO: Color32 = Color32::from_rgb(46, 160, 67);
 const COR_ERRO: Color32 = Color32::from_rgb(218, 54, 51);
 const COR_AVISO: Color32 = Color32::from_rgb(210, 140, 30);
@@ -46,6 +52,7 @@ enum Dialogo {
     Substituir,
     /// Fechar a janela com um download em andamento.
     FecharComDownload,
+    Sobre,
 }
 
 /// Ação escolhida num diálogo, aplicada depois de desenhá-lo.
@@ -67,6 +74,10 @@ struct App {
     sha256: String,
     referer: String,
     cookie: String,
+    proxy: String,
+    escuro: bool,
+    tema_aplicado: bool,
+    icone: Option<egui::TextureHandle>,
     /// URLs esperando a vez, baixadas uma após a outra.
     fila: VecDeque<String>,
 
@@ -79,6 +90,8 @@ struct App {
     avancar_fila: bool,
     /// (instante, bytes baixados) para calcular a velocidade recente.
     amostras: VecDeque<(Instant, u64)>,
+    /// Segmentos prontos do download atual, para o mapa de progresso.
+    mapa: Vec<bool>,
 
     progresso: f32,
     indeterminado: bool,
@@ -91,7 +104,7 @@ struct App {
 }
 
 impl App {
-    fn com_preferencias(prefs: Preferencias) -> Self {
+    fn com_preferencias(prefs: Preferencias, fila: Vec<String>) -> Self {
         Self {
             url: String::new(),
             destino: String::new(),
@@ -101,13 +114,18 @@ impl App {
             sha256: String::new(),
             referer: String::new(),
             cookie: String::new(),
-            fila: VecDeque::new(),
+            proxy: prefs.proxy.unwrap_or_default(),
+            escuro: prefs.escuro,
+            tema_aplicado: false,
+            icone: None,
+            fila: fila.into(),
             em_andamento: false,
             ctl: None,
             rx: None,
             fechar_ao_terminar: false,
             avancar_fila: false,
             amostras: VecDeque::new(),
+            mapa: Vec::new(),
             progresso: 0.0,
             indeterminado: false,
             status: "Pronto para baixar.".into(),
@@ -116,6 +134,32 @@ impl App {
             registro: Vec::new(),
             dialogo: Dialogo::Nenhum,
             ultimo_sucesso: None,
+        }
+    }
+
+    fn preferencias(&self) -> Preferencias {
+        Preferencias {
+            conexoes: self.conexoes,
+            limite_kbps: self.limite_kbps,
+            pasta: self.pasta.clone(),
+            escuro: self.escuro,
+            proxy: (!self.proxy.trim().is_empty()).then(|| self.proxy.trim().to_string()),
+        }
+    }
+
+    fn salvar_prefs(&self) {
+        if let Err(e) = config::salvar_em(&config::caminho_padrao(), &self.preferencias()) {
+            registro::registrar(
+                "WARN",
+                format!("não foi possível salvar as preferências: {e}"),
+            );
+        }
+    }
+
+    fn persistir_fila(&self) {
+        let itens: Vec<String> = self.fila.iter().cloned().collect();
+        if let Err(e) = config::salvar_fila(&config::caminho_fila(), &itens) {
+            registro::registrar("WARN", format!("não foi possível salvar a fila: {e}"));
         }
     }
 }
@@ -150,6 +194,41 @@ fn abrir_pasta(pasta: &Path) {
     }
 }
 
+/// Cartão: bloco com título, usado para agrupar os campos.
+fn cartao(ui: &mut egui::Ui, titulo: &str, conteudo: impl FnOnce(&mut egui::Ui)) {
+    egui::Frame::group(ui.style()).show(ui, |ui| {
+        ui.label(RichText::new(titulo).strong().size(14.0));
+        ui.add_space(4.0);
+        conteudo(ui);
+    });
+}
+
+/// Mapa de segmentos: um quadrado por segmento, azul quando já foi baixado.
+fn desenhar_mapa(ui: &mut egui::Ui, mapa: &[bool]) {
+    let largura = ui.available_width().max(80.0);
+    let passo = 9.0_f32;
+    let colunas = ((largura / passo).floor() as usize).max(1);
+    let linhas = mapa.len().div_ceil(colunas).max(1);
+    // Limita a altura para não crescer sem fim com muitos segmentos.
+    let altura = (linhas as f32 * passo).min(72.0);
+    let celula_h = altura / linhas as f32;
+    let celula_w = largura / colunas as f32;
+
+    let (resposta, pintor) = ui.allocate_painter(egui::vec2(largura, altura), egui::Sense::hover());
+    let origem = resposta.rect.min;
+    let cinza = ui.visuals().widgets.inactive.bg_fill;
+    for (i, &pronto) in mapa.iter().enumerate() {
+        let (col, lin) = (i % colunas, i / colunas);
+        let pos = origem + egui::vec2(col as f32 * celula_w, lin as f32 * celula_h);
+        let rect = egui::Rect::from_min_size(
+            pos,
+            egui::vec2((celula_w - 2.0).max(1.0), (celula_h - 2.0).max(1.0)),
+        );
+        let cor = if pronto { ACENTO } else { cinza };
+        pintor.rect_filled(rect, 2.0, cor);
+    }
+}
+
 impl App {
     fn validar(&self) -> Option<String> {
         let url = self.url.trim();
@@ -162,6 +241,10 @@ impl App {
         let sha = self.sha256.trim();
         if !sha.is_empty() && !sha_valido(sha) {
             return Some("O SHA-256 deve ter 64 caracteres hexadecimais (ou ficar vazio).".into());
+        }
+        let proxy = self.proxy.trim();
+        if !proxy.is_empty() && !(proxy.starts_with("http://") || proxy.starts_with("https://")) {
+            return Some("O proxy deve começar com http:// ou https://.".into());
         }
         None
     }
@@ -200,6 +283,7 @@ impl App {
             && let Some(proxima) = self.fila.pop_front()
         {
             self.url = proxima;
+            self.persistir_fila();
         }
         if let Some(erro) = self.validar() {
             self.mostrar_erro(erro);
@@ -223,6 +307,7 @@ impl App {
         self.registrar(format!("Adicionado à fila: {url}"));
         self.fila.push_back(url);
         self.url.clear();
+        self.persistir_fila();
     }
 
     fn cabecalhos(&self) -> Vec<(String, String)> {
@@ -241,19 +326,7 @@ impl App {
         let destino = self.destino_efetivo();
         self.destino = destino.display().to_string();
         self.pasta = destino.parent().map(|p| p.display().to_string());
-
-        // Guarda as preferências usadas nesta execução.
-        let prefs = Preferencias {
-            conexoes: self.conexoes,
-            limite_kbps: self.limite_kbps,
-            pasta: self.pasta.clone(),
-        };
-        if let Err(e) = config::salvar_em(&config::caminho_padrao(), &prefs) {
-            registro::registrar(
-                "WARN",
-                format!("não foi possível salvar as preferências: {e}"),
-            );
-        }
+        self.salvar_prefs();
 
         let sha = self.sha256.trim();
         let cfg = Config {
@@ -263,6 +336,7 @@ impl App {
             limite_kbps: self.limite_kbps,
             sha256: (!sha.is_empty()).then(|| sha.to_string()),
             cabecalhos: self.cabecalhos(),
+            proxy: (!self.proxy.trim().is_empty()).then(|| self.proxy.trim().to_string()),
         };
         let ctl = Ctl::default();
         let (tx, rx) = mpsc::channel::<Evento>();
@@ -297,6 +371,7 @@ impl App {
         self.detalhes.clear();
         self.ultimo_sucesso = None;
         self.amostras.clear();
+        self.mapa.clear();
         self.ctl = Some(ctl);
         self.rx = Some(rx);
     }
@@ -379,6 +454,7 @@ impl App {
                     if !self.fila.is_empty() {
                         self.registrar(format!("Fila cancelada ({} itens).", self.fila.len()));
                         self.fila.clear();
+                        self.persistir_fila();
                     }
                     self.avancar_fila = false;
                 }
@@ -391,6 +467,7 @@ impl App {
         if self.avancar_fila && !self.fechar_ao_terminar && !self.em_andamento {
             self.avancar_fila = false;
             if let Some(proxima) = self.fila.pop_front() {
+                self.persistir_fila();
                 self.url = proxima;
                 self.destino.clear();
                 if let Some(erro) = self.validar() {
@@ -410,11 +487,14 @@ impl App {
         self.detalhes.clear();
     }
 
-    /// Atualiza barra, velocidade e tempo restante a partir dos contadores atômicos.
+    /// Atualiza barra, velocidade, tempo restante e mapa a partir dos contadores.
     fn atualizar_progresso(&mut self) {
         let Some(ctl) = &self.ctl else { return };
         let baixado = ctl.baixado.load(Ordering::Relaxed);
         let total = ctl.total.load(Ordering::Relaxed);
+        if let Ok(mapa) = ctl.mapa.lock() {
+            self.mapa.clone_from(&mapa);
+        }
 
         // Velocidade pela média dos últimos segundos, sem contar bytes que já estavam no disco.
         let agora = Instant::now();
@@ -476,11 +556,30 @@ impl App {
         }
     }
 
-    /// Cabeçalho: título e atalho para a pasta de logs.
+    /// Cabeçalho: ícone, título e ações rápidas (tema, logs e sobre).
     fn desenhar_cabecalho(&mut self, ui: &mut egui::Ui) {
         ui.horizontal(|ui| {
-            ui.heading("Rajada");
+            if let Some(icone) = &self.icone {
+                ui.add(egui::Image::new(icone).fit_to_exact_size(egui::vec2(40.0, 40.0)));
+            }
+            ui.vertical(|ui| {
+                ui.label(RichText::new("Rajada").strong().size(22.0));
+                ui.label(RichText::new("Baixa arquivos em várias conexões ao mesmo tempo.").weak());
+            });
             ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                if ui.small_button("Sobre").clicked() {
+                    self.dialogo = Dialogo::Sobre;
+                }
+                let rotulo = if self.escuro {
+                    "Tema claro"
+                } else {
+                    "Tema escuro"
+                };
+                if ui.small_button(rotulo).clicked() {
+                    self.escuro = !self.escuro;
+                    self.tema_aplicado = false;
+                    self.salvar_prefs();
+                }
                 if ui
                     .small_button("Pasta de logs")
                     .on_hover_text("Abre a pasta onde ficam os arquivos de log")
@@ -492,13 +591,12 @@ impl App {
                 }
             });
         });
-        ui.label(RichText::new("Baixa arquivos em várias conexões ao mesmo tempo.").weak());
-        ui.add_space(8.0);
+        ui.add_space(6.0);
     }
 
-    /// Campos de URL e destino.
-    fn desenhar_entrada(&mut self, ui: &mut egui::Ui) {
-        egui::Frame::group(ui.style()).show(ui, |ui| {
+    /// Cartão de download: URL, destino e botões principais.
+    fn desenhar_download(&mut self, ui: &mut egui::Ui) {
+        cartao(ui, "Download", |ui| {
             egui::Grid::new("grade_entrada")
                 .num_columns(2)
                 .spacing([10.0, 8.0])
@@ -516,7 +614,7 @@ impl App {
 
                     ui.label("Salvar em");
                     ui.horizontal(|ui| {
-                        let largura = (ui.available_width() - 120.0).max(120.0);
+                        let largura = (ui.available_width() - 110.0).max(120.0);
                         ui.add(
                             egui::TextEdit::singleline(&mut self.destino)
                                 .desired_width(largura)
@@ -528,7 +626,7 @@ impl App {
                     });
                     ui.end_row();
                 });
-            // Mostra o nome final que será usado, antes de iniciar.
+
             if !self.url.trim().is_empty() && self.validar().is_none() {
                 let nome = self
                     .destino_efetivo()
@@ -537,28 +635,67 @@ impl App {
                     .unwrap_or_default();
                 ui.label(RichText::new(format!("Arquivo: {nome}")).weak().small());
             }
+
+            ui.add_space(6.0);
+            ui.horizontal(|ui| {
+                let botao_iniciar =
+                    egui::Button::new(RichText::new("Iniciar").strong().color(Color32::WHITE))
+                        .fill(ACENTO)
+                        .min_size(egui::vec2(120.0, 32.0));
+                if ui.add_enabled(!self.em_andamento, botao_iniciar).clicked() {
+                    self.pedir_inicio();
+                }
+                if ui
+                    .add_enabled(
+                        self.em_andamento,
+                        egui::Button::new("Cancelar").min_size(egui::vec2(100.0, 32.0)),
+                    )
+                    .on_hover_text("Atalho: Esc")
+                    .clicked()
+                {
+                    self.cancelar();
+                }
+                if ui
+                    .add_enabled(
+                        !self.url.trim().is_empty(),
+                        egui::Button::new("Adicionar à fila").min_size(egui::vec2(130.0, 32.0)),
+                    )
+                    .on_hover_text("Guarda esta URL para baixar depois, uma após a outra")
+                    .clicked()
+                {
+                    self.adicionar_fila();
+                }
+                if let Some(arquivo) = self.ultimo_sucesso.clone()
+                    && ui.button("Abrir pasta do arquivo").clicked()
+                    && let Some(pasta) = arquivo.parent()
+                {
+                    abrir_pasta(pasta);
+                }
+            });
         });
     }
 
-    /// Conexões e limite de velocidade.
+    /// Cartão de opções: conexões, limite e campos avançados.
     fn desenhar_opcoes(&mut self, ui: &mut egui::Ui) {
-        egui::Frame::group(ui.style()).show(ui, |ui| {
+        cartao(ui, "Opções", |ui| {
             ui.horizontal(|ui| {
                 ui.label("Conexões");
                 ui.add_enabled(
                     !self.em_andamento,
-                    egui::DragValue::new(&mut self.conexoes).range(1..=32),
+                    egui::Slider::new(&mut self.conexoes, 1..=32),
                 )
                 .on_hover_text(
                     "Quantas partes baixar ao mesmo tempo (1 a 32). Fica salvo para a próxima vez.",
                 );
-                ui.add_space(24.0);
+            });
+            ui.horizontal(|ui| {
                 ui.label("Limite (KB/s)");
                 ui.add_enabled(
                     !self.em_andamento,
                     egui::DragValue::new(&mut self.limite_kbps).range(0..=10_000_000),
                 )
                 .on_hover_text("0 = sem limite de velocidade.");
+                ui.label(RichText::new("0 = sem limite").weak().small());
             });
 
             egui::CollapsingHeader::new("Avançado (opcional)")
@@ -568,91 +705,38 @@ impl App {
                         .num_columns(2)
                         .spacing([10.0, 6.0])
                         .show(ui, |ui| {
-                            ui.label("SHA-256");
-                            ui.add_enabled(
-                                !self.em_andamento,
-                                egui::TextEdit::singleline(&mut self.sha256)
-                                    .desired_width(f32::INFINITY)
-                                    .hint_text("64 caracteres; confere o arquivo ao final"),
-                            );
-                            ui.end_row();
-
-                            ui.label("Referer");
-                            ui.add_enabled(
-                                !self.em_andamento,
-                                egui::TextEdit::singleline(&mut self.referer)
-                                    .desired_width(f32::INFINITY)
-                                    .hint_text("Página de origem, se o site exigir"),
-                            );
-                            ui.end_row();
-
-                            ui.label("Cookie");
-                            ui.add_enabled(
-                                !self.em_andamento,
-                                egui::TextEdit::singleline(&mut self.cookie)
-                                    .desired_width(f32::INFINITY)
-                                    .hint_text("nome=valor; outro=valor"),
-                            );
-                            ui.end_row();
+                            let campos = [
+                                (
+                                    "SHA-256",
+                                    &mut self.sha256,
+                                    "64 caracteres; confere o arquivo ao final",
+                                ),
+                                (
+                                    "Referer",
+                                    &mut self.referer,
+                                    "Página de origem, se o site exigir",
+                                ),
+                                ("Cookie", &mut self.cookie, "nome=valor; outro=valor"),
+                                ("Proxy", &mut self.proxy, "http://servidor:8080"),
+                            ];
+                            for (rotulo, valor, dica) in campos {
+                                ui.label(rotulo);
+                                ui.add_enabled(
+                                    !self.em_andamento,
+                                    egui::TextEdit::singleline(valor)
+                                        .desired_width(f32::INFINITY)
+                                        .hint_text(dica),
+                                );
+                                ui.end_row();
+                            }
                         });
                 });
         });
     }
 
-    /// Botões de ação.
-    fn desenhar_acoes(&mut self, ui: &mut egui::Ui) {
-        ui.horizontal(|ui| {
-            let tamanho = egui::vec2(120.0, 30.0);
-            if ui
-                .add_enabled(
-                    !self.em_andamento,
-                    egui::Button::new(RichText::new("Iniciar").strong()).min_size(tamanho),
-                )
-                .clicked()
-            {
-                self.pedir_inicio();
-            }
-            if ui
-                .add_enabled(
-                    self.em_andamento,
-                    egui::Button::new("Cancelar").min_size(tamanho),
-                )
-                .on_hover_text("Atalho: Esc")
-                .clicked()
-            {
-                self.cancelar();
-            }
-            if let Some(arquivo) = self.ultimo_sucesso.clone()
-                && ui.button("Abrir pasta do arquivo").clicked()
-                && let Some(pasta) = arquivo.parent()
-            {
-                abrir_pasta(pasta);
-            }
-        });
-
-        ui.horizontal(|ui| {
-            if ui
-                .add_enabled(
-                    !self.url.trim().is_empty(),
-                    egui::Button::new("Adicionar à fila"),
-                )
-                .on_hover_text("Guarda esta URL para baixar depois, uma após a outra")
-                .clicked()
-            {
-                self.adicionar_fila();
-            }
-            if !self.fila.is_empty() {
-                ui.label(format!("Fila: {} item(ns)", self.fila.len()));
-                if ui.small_button("Limpar fila").clicked() {
-                    self.fila.clear();
-                }
-            }
-        });
-    }
-
-    /// Barra de progresso, status e detalhes.
+    /// Cartão de progresso: barra, status, velocidade e mapa de segmentos.
     fn desenhar_status(&mut self, ui: &mut egui::Ui) {
-        egui::Frame::group(ui.style()).show(ui, |ui| {
+        cartao(ui, "Progresso", |ui| {
             if self.indeterminado {
                 ui.add(egui::ProgressBar::new(0.0).animate(true));
             } else {
@@ -667,34 +751,71 @@ impl App {
             if !self.detalhes.is_empty() {
                 ui.label(RichText::new(&self.detalhes).weak());
             }
+            if !self.mapa.is_empty() {
+                ui.add_space(6.0);
+                ui.label(RichText::new("Partes").weak().small());
+                desenhar_mapa(ui, &self.mapa);
+            }
         });
     }
 
-    /// Registro de eventos, com erros em destaque.
-    fn desenhar_registro(&mut self, ui: &mut egui::Ui) {
-        ui.horizontal(|ui| {
-            ui.label(RichText::new("Registro").strong());
-            ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
-                if ui.small_button("Limpar").clicked() {
-                    self.registro.clear();
+    /// Cartão da fila, com remoção de itens.
+    fn desenhar_fila(&mut self, ui: &mut egui::Ui) {
+        if self.fila.is_empty() {
+            return;
+        }
+        cartao(ui, &format!("Fila ({} item(ns))", self.fila.len()), |ui| {
+            let mut remover = None;
+            for (i, url) in self.fila.iter().enumerate() {
+                ui.horizontal(|ui| {
+                    if ui
+                        .small_button("✕")
+                        .on_hover_text("Remover da fila")
+                        .clicked()
+                    {
+                        remover = Some(i);
+                    }
+                    ui.label(RichText::new(url).small());
+                });
+            }
+            ui.horizontal(|ui| {
+                if ui.small_button("Limpar fila").clicked() {
+                    self.fila.clear();
+                    self.persistir_fila();
                 }
             });
+            if let Some(i) = remover {
+                self.fila.remove(i);
+                self.persistir_fila();
+            }
         });
-        egui::Frame::group(ui.style()).show(ui, |ui| {
-            egui::ScrollArea::vertical()
-                .stick_to_bottom(true)
-                .auto_shrink([false, false])
-                .show(ui, |ui| {
-                    for linha in &self.registro {
-                        let texto = RichText::new(linha).monospace().small();
-                        if linha.starts_with("ERRO") {
-                            ui.label(texto.color(COR_ERRO));
-                        } else {
-                            ui.label(texto);
-                        }
+    }
+
+    /// Registro de eventos, recolhido por padrão.
+    fn desenhar_registro(&mut self, ui: &mut egui::Ui) {
+        egui::CollapsingHeader::new("Registro")
+            .default_open(false)
+            .show(ui, |ui| {
+                ui.horizontal(|ui| {
+                    if ui.small_button("Limpar").clicked() {
+                        self.registro.clear();
                     }
                 });
-        });
+                egui::ScrollArea::vertical()
+                    .stick_to_bottom(true)
+                    .max_height(180.0)
+                    .auto_shrink([false, false])
+                    .show(ui, |ui| {
+                        for linha in &self.registro {
+                            let texto = RichText::new(linha).monospace().small();
+                            if linha.starts_with("ERRO") {
+                                ui.label(texto.color(COR_ERRO));
+                            } else {
+                                ui.label(texto);
+                            }
+                        }
+                    });
+            });
     }
 
     /// Diálogos modais. Devolve a ação escolhida, se houver.
@@ -709,6 +830,23 @@ impl App {
                     .anchor(egui::Align2::CENTER_CENTER, [0.0, 0.0])
                     .show(ctx, |ui| {
                         ui.label(texto.as_str());
+                        ui.add_space(8.0);
+                        if ui.button("OK").clicked() {
+                            acao = Some(Acao::Fechar);
+                        }
+                    });
+            }
+            Dialogo::Sobre => {
+                egui::Window::new("Sobre o Rajada")
+                    .collapsible(false)
+                    .resizable(false)
+                    .anchor(egui::Align2::CENTER_CENTER, [0.0, 0.0])
+                    .show(ctx, |ui| {
+                        ui.label(RichText::new("Rajada").strong().size(18.0));
+                        ui.label(format!("Versão {}", env!("CARGO_PKG_VERSION")));
+                        ui.add_space(4.0);
+                        ui.label("Acelerador de downloads com várias conexões.");
+                        ui.label("Licença MIT.");
                         ui.add_space(8.0);
                         if ui.button("OK").clicked() {
                             acao = Some(Acao::Fechar);
@@ -775,6 +913,21 @@ impl App {
             }
         }
     }
+
+    fn aplicar_tema(&mut self, ctx: &egui::Context) {
+        if self.tema_aplicado {
+            return;
+        }
+        let mut visuais = if self.escuro {
+            egui::Visuals::dark()
+        } else {
+            egui::Visuals::light()
+        };
+        visuais.selection.bg_fill = ACENTO;
+        visuais.hyperlink_color = ACENTO;
+        ctx.set_visuals(visuais);
+        self.tema_aplicado = true;
+    }
 }
 
 impl eframe::App for App {
@@ -805,21 +958,31 @@ impl eframe::App for App {
 
     /// Desenho da janela.
     fn ui(&mut self, ui: &mut egui::Ui, _frame: &mut eframe::Frame) {
+        let ctx = ui.ctx().clone();
+        self.aplicar_tema(&ctx);
+        if self.icone.is_none() {
+            let imagem =
+                egui::ColorImage::from_rgba_unmultiplied([ICONE_LADO, ICONE_LADO], ICONE_RGBA);
+            self.icone = Some(ctx.load_texture("icone", imagem, egui::TextureOptions::LINEAR));
+        }
+
         egui::CentralPanel::default().show(ui, |ui| {
-            ui.add_space(4.0);
-            self.desenhar_cabecalho(ui);
-            self.desenhar_entrada(ui);
-            ui.add_space(6.0);
-            self.desenhar_opcoes(ui);
-            ui.add_space(8.0);
-            self.desenhar_acoes(ui);
-            ui.add_space(8.0);
-            self.desenhar_status(ui);
-            ui.add_space(8.0);
-            self.desenhar_registro(ui);
+            egui::ScrollArea::vertical()
+                .auto_shrink([false, false])
+                .show(ui, |ui| {
+                    self.desenhar_cabecalho(ui);
+                    self.desenhar_download(ui);
+                    ui.add_space(6.0);
+                    self.desenhar_opcoes(ui);
+                    ui.add_space(6.0);
+                    self.desenhar_status(ui);
+                    ui.add_space(6.0);
+                    self.desenhar_fila(ui);
+                    ui.add_space(6.0);
+                    self.desenhar_registro(ui);
+                });
         });
 
-        let ctx = ui.ctx().clone();
         if let Some(acao) = self.desenhar_dialogo(&ctx) {
             self.aplicar_acao(acao);
         }
@@ -848,6 +1011,7 @@ fn main() -> eframe::Result<()> {
     );
 
     let prefs = config::carregar_de(&config::caminho_padrao());
+    let fila = config::carregar_fila(&config::caminho_fila());
 
     let renderer = if teste == "glow" {
         eframe::Renderer::Glow
@@ -860,11 +1024,17 @@ fn main() -> eframe::Result<()> {
         wgpu_options.surface.present_mode = eframe::egui_wgpu::wgpu::PresentMode::AutoNoVsync;
     }
 
+    let icone = egui::IconData {
+        rgba: ICONE_RGBA.to_vec(),
+        width: ICONE_LADO as u32,
+        height: ICONE_LADO as u32,
+    };
     let opcoes = eframe::NativeOptions {
         viewport: egui::ViewportBuilder::default()
-            .with_inner_size([680.0, 620.0])
+            .with_inner_size([700.0, 680.0])
             .with_min_inner_size([560.0, 480.0])
-            .with_title("Rajada"),
+            .with_title("Rajada")
+            .with_icon(Arc::new(icone)),
         renderer,
         wgpu_options,
         ..Default::default()
@@ -873,7 +1043,7 @@ fn main() -> eframe::Result<()> {
     let resultado = eframe::run_native(
         "Rajada",
         opcoes,
-        Box::new(move |_cc| Ok(Box::new(App::com_preferencias(prefs)))),
+        Box::new(move |_cc| Ok(Box::new(App::com_preferencias(prefs, fila)))),
     );
 
     // No Windows, sem console, uma falha ao abrir a janela passaria despercebida.

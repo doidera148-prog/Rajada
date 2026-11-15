@@ -107,6 +107,8 @@ pub struct Config {
     pub sha256: Option<String>,
     /// Cabeçalhos extras enviados em todas as requisições (ex.: Referer, Cookie).
     pub cabecalhos: Vec<(String, String)>,
+    /// Proxy HTTP/HTTPS, por exemplo http://servidor:8080. Vazio = sem proxy.
+    pub proxy: Option<String>,
 }
 
 /// Estado compartilhado entre a interface e o motor.
@@ -117,6 +119,8 @@ pub struct Ctl {
     pub baixado: Arc<AtomicU64>,
     /// 0 = tamanho desconhecido.
     pub total: Arc<AtomicU64>,
+    /// Segmentos prontos (download segmentado), para desenhar o progresso.
+    pub mapa: Arc<Mutex<Vec<bool>>>,
 }
 
 impl Ctl {
@@ -394,16 +398,16 @@ fn sha256_arquivo(caminho: &Path) -> io::Result<String> {
     Ok(format!("{:x}", hasher.finalize()))
 }
 
-/// Interpreta `Content-Range: bytes a-b/total`.
-fn parse_content_range(v: &str) -> Option<(u64, u64, u64)> {
+/// Interpreta `Content-Range: bytes a-b/total`. O total pode ser `*` (desconhecido).
+fn parse_content_range(v: &str) -> Option<(u64, u64, Option<u64>)> {
     let resto = v.trim().strip_prefix("bytes ")?;
     let (intervalo, total) = resto.split_once('/')?;
     let (a, b) = intervalo.split_once('-')?;
-    Some((
-        a.trim().parse().ok()?,
-        b.trim().parse().ok()?,
-        total.trim().parse().ok()?,
-    ))
+    let total = match total.trim() {
+        "*" => None,
+        t => Some(t.parse().ok()?),
+    };
+    Some((a.trim().parse().ok()?, b.trim().parse().ok()?, total))
 }
 
 /// Aplica os cabeçalhos personalizados a uma requisição.
@@ -434,11 +438,16 @@ fn executar_interno(cfg: &Config, ctl: &Ctl, log: &(dyn Fn(String) + Sync)) -> R
         ));
     }
 
-    let agent = ureq::AgentBuilder::new()
+    let mut construtor = ureq::AgentBuilder::new()
         .timeout_connect(TIMEOUT)
         .timeout_read(TIMEOUT)
-        .user_agent(AGENTE)
-        .build();
+        .user_agent(AGENTE);
+    if let Some(endereco) = cfg.proxy.as_deref().filter(|p| !p.trim().is_empty()) {
+        let proxy = ureq::Proxy::new(endereco.trim())
+            .map_err(|e| ErroDl::Permanente(format!("proxy inválido: {e}")))?;
+        construtor = construtor.proxy(proxy);
+    }
+    let agent = construtor.build();
 
     crate::registro::registrar(
         "INFO",
@@ -454,6 +463,7 @@ fn executar_interno(cfg: &Config, ctl: &Ctl, log: &(dyn Fn(String) + Sync)) -> R
     if let Some(pasta) = cfg.destino.parent().filter(|p| !p.as_os_str().is_empty()) {
         fs::create_dir_all(pasta)?;
     }
+    trava(&ctl.mapa).clear();
 
     log(format!("Consultando servidor: {}", redigir(&cfg.url)));
     let sonda = sondar(&agent, &cfg.url, &cfg.cabecalhos)?;
@@ -621,7 +631,7 @@ fn sondar(agent: &ureq::Agent, url: &str, cabecalhos: &[(String, String)]) -> Re
             let total = r
                 .header("Content-Range")
                 .and_then(parse_content_range)
-                .map(|(_, _, t)| t);
+                .and_then(|(_, _, t)| t);
             Ok(Sonda {
                 tamanho: total.or(tamanho_head),
                 range: true,
@@ -683,6 +693,7 @@ fn baixar_segmentado(cfg: &Config, ctx: &Ctx) -> Res<()> {
     ctx.ctl
         .baixado
         .store(estado.bytes_feitos(), Ordering::Relaxed);
+    *trava(&ctx.ctl.mapa) = estado.feitos.clone();
     let pendentes: Vec<usize> = estado
         .feitos
         .iter()
@@ -790,6 +801,9 @@ fn trabalhador(c: &Compartilhado, ctx: &Ctx) {
                     trava(&c.erros).push(format!("parte {}: {msg}", i + 1));
                     continue;
                 }
+                if let Some(marca) = trava(&ctx.ctl.mapa).get_mut(i) {
+                    *marca = true;
+                }
                 let mut estado = trava(&c.estado);
                 estado.feitos[i] = true;
                 if let Err(e) = salvar_estado(&c.estado_path, &estado) {
@@ -859,16 +873,15 @@ fn tentar_segmento(ctx: &Ctx, arq: &File, ini: u64, fim: u64, escritos: &mut u64
     match resp.status() {
         206 => {
             // Alguns servidores ignoram If-Range: confere se a parte é a pedida.
-            let (inicio_resp, total_resp) =
-                match resp.header("Content-Range").and_then(parse_content_range) {
-                    Some((a, _, t)) => (a, t),
-                    None => {
-                        return Err(ErroDl::Permanente(
-                            "resposta 206 sem Content-Range válido".into(),
-                        ));
-                    }
-                };
-            if inicio_resp != ini || (ctx.tamanho > 0 && total_resp != ctx.tamanho) {
+            let Some((inicio_resp, _, total_resp)) =
+                resp.header("Content-Range").and_then(parse_content_range)
+            else {
+                return Err(ErroDl::Permanente(
+                    "resposta 206 sem Content-Range válido".into(),
+                ));
+            };
+            let total_diferente = total_resp.is_some_and(|t| ctx.tamanho > 0 && t != ctx.tamanho);
+            if inicio_resp != ini || total_diferente {
                 return Err(ErroDl::Mudou);
             }
         }
@@ -1208,6 +1221,7 @@ mod tests {
             limite_kbps: limite,
             sha256: None,
             cabecalhos: Vec::new(),
+            proxy: None,
         }
     }
 
@@ -1392,12 +1406,8 @@ mod tests {
         let dir = pasta_tmp("cancela");
         let destino = dir.join("saida.bin");
         let ctl = Ctl::default();
-        let ctl2 = ctl.clone();
         // 200 KB/s em 3 MB levaria ~15 s; cancelamos após 300 ms.
-        thread::spawn(move || {
-            thread::sleep(Duration::from_millis(300));
-            ctl2.cancelar.store(true, Ordering::Relaxed);
-        });
+        cancelar_ao_chegar_em(ctl.clone(), 1);
         let res = executar(&cfg(url, destino.clone(), 4, 200), &ctl, &nao_loga);
         assert!(matches!(res, Err(ErroDl::Cancelado)), "esperava Cancelado");
         assert!(!destino.exists(), "arquivo final não deveria existir");
@@ -1411,11 +1421,7 @@ mod tests {
         let dir = pasta_tmp("cancela_simples");
         let destino = dir.join("saida.bin");
         let ctl = Ctl::default();
-        let ctl2 = ctl.clone();
-        thread::spawn(move || {
-            thread::sleep(Duration::from_millis(300));
-            ctl2.cancelar.store(true, Ordering::Relaxed);
-        });
+        cancelar_ao_chegar_em(ctl.clone(), 1);
         let res = executar(&cfg(url, destino.clone(), 1, 200), &ctl, &nao_loga);
         assert!(matches!(res, Err(ErroDl::Cancelado)));
         assert!(!destino.exists());
@@ -1431,11 +1437,7 @@ mod tests {
         let dir = pasta_tmp("cancela_rapido");
         let destino = dir.join("saida.bin");
         let ctl = Ctl::default();
-        let ctl2 = ctl.clone();
-        thread::spawn(move || {
-            thread::sleep(Duration::from_millis(300));
-            ctl2.cancelar.store(true, Ordering::Relaxed);
-        });
+        cancelar_ao_chegar_em(ctl.clone(), 1);
         let inicio = Instant::now();
         let res = executar(&cfg(url, destino, 4, 10), &ctl, &nao_loga);
         assert!(matches!(res, Err(ErroDl::Cancelado)));
@@ -1522,7 +1524,11 @@ mod tests {
 
     #[test]
     fn content_range_e_sha_validos() {
-        assert_eq!(parse_content_range("bytes 0-99/1000"), Some((0, 99, 1000)));
+        assert_eq!(
+            parse_content_range("bytes 0-99/1000"),
+            Some((0, 99, Some(1000)))
+        );
+        assert_eq!(parse_content_range("bytes 0-99/*"), Some((0, 99, None)));
         assert_eq!(parse_content_range("bytes */1000"), None);
         assert!(sha_valido(&"a".repeat(64)));
         assert!(!sha_valido(&"g".repeat(64)));

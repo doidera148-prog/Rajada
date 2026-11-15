@@ -5,10 +5,7 @@ on:
     # Sem "branches", o GitHub só dispara para tags quando "tags" está definido.
     branches:
       - main
-    # Commits que mexem só em dist/ não disparam o workflow (evita loop).
-    paths-ignore:
-      - 'dist/**'
-    # Tags v* geram uma release com os binários.
+    # Tags v* geram uma release com os binários (aba Releases).
     tags:
       - 'v*'
   pull_request:
@@ -135,54 +132,6 @@ jobs:
         with:
           name: rajada-macos-universal
           path: saida/rajada-macos-universal
-
-  # Só em push para o main: copia os binários para dist/ e faz commit.
-  publicar:
-    # Roda mesmo se um dos builds falhar: publica o que foi gerado.
-    if: ${{ !cancelled() && github.event_name == 'push' && github.ref == 'refs/heads/main' }}
-    needs: [build, build-macos]
-    runs-on: ubuntu-latest
-    permissions:
-      contents: write
-    steps:
-      - uses: actions/checkout@v4
-
-      - name: Baixar binários
-        uses: actions/download-artifact@v4
-        with:
-          path: baixados
-          merge-multiple: true
-
-      - name: Copiar para dist/
-        shell: bash
-        run: |
-          mkdir -p dist
-          ls -la baixados || true
-          for f in rajada-linux-x86_64 rajada-windows-x86_64.exe rajada-macos-universal; do
-            if [ -f "baixados/$f" ]; then
-              cp "baixados/$f" dist/
-              echo "copiado: $f"
-            else
-              echo "::warning::$f não foi gerado nesta execução (veja o job de build correspondente)"
-            fi
-          done
-          chmod 755 dist/rajada-linux-x86_64 dist/rajada-macos-universal 2>/dev/null || true
-          # Versão antiga (só Apple Silicon), substituída pelo universal.
-          git rm -f --ignore-unmatch dist/rajada-macos-arm64
-
-      - name: Commitar e enviar ao main
-        shell: bash
-        run: |
-          git config user.name "github-actions[bot]"
-          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
-          git add dist
-          if git diff --cached --quiet; then
-            echo "dist/ já está atualizado."
-            exit 0
-          fi
-          git commit -m "Atualiza binários em dist/ [skip ci]"
-          # Se o main avançou enquanto isso, a próxima execução atualiza dist/ de novo.
-          git push origin HEAD:main || echo "main avançou; a próxima execução atualiza dist/."
 
   # Só em push para o main: aplica rustfmt e clippy --fix, e envia se os testes passarem.
   corrigir:

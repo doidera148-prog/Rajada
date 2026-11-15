@@ -31,24 +31,27 @@ conexões paralelas. Escrito em Rust, roda no **Windows**, **Linux** e **macOS**
 - **Verificação de espaço em disco** antes de começar.
 - **Mark of the Web (Windows):** arquivos baixados são marcados como vindos da internet.
 - **Aviso visível** se a janela não puder ser aberta (Windows, sem console).
+- **Ícone** no programa, na janela e no executável do Windows.
+- **Tema claro ou escuro**, escolhido no cabeçalho e lembrado.
+- **Mapa de partes:** cada quadrado mostra um segmento; os concluídos ficam azuis.
+- **Proxy HTTP/HTTPS** (opcional, em *Avançado*).
+- **Fila salva:** os itens da fila continuam lá se você fechar o programa.
 
 ## Instalação
 
 ### Opção A — baixar pronto
 
-**Pasta `dist/`:** a cada alteração enviada ao `main`, o workflow **CI** compila os
-binários e atualiza a pasta [`dist/`](dist/):
+Baixe os binários na aba **Releases** do GitHub. Cada versão traz os três sistemas e o
+arquivo `SHA256SUMS.txt`, para conferir a integridade:
 
-| Sistema | Arquivo em `dist/` |
+| Sistema | Arquivo |
 |---|---|
 | Windows 10/11 | `rajada-windows-x86_64.exe` |
 | Linux (x86_64) | `rajada-linux-x86_64` |
 | macOS (Apple Silicon e Intel) | `rajada-macos-universal` |
 
-**Releases:** cada tag `v*` cria uma release no GitHub, com os três binários e o arquivo
-`SHA256SUMS.txt` para conferir a integridade.
-
-Os binários também ficam disponíveis como artefatos na aba **Actions** de cada execução.
+Os binários não ficam versionados no repositório. Para testes, eles também aparecem como
+artefatos na aba **Actions** de cada execução do CI.
 
 ### Opção B — compilar no seu computador
 
@@ -78,9 +81,10 @@ O script instala o Rust via rustup, se faltar, e gera o binário `rajada`.
 
 **Fila:** digite a URL e clique em **Adicionar à fila**. Repita para outras URLs e clique
 em **Iniciar** (com o campo URL vazio) para baixar uma após a outra. Um erro não para a fila;
-cancelar, sim.
+cancelar, sim. Cada item pode ser removido pelo ✕, e a fila é salva a cada alteração.
 
-**Avançado:** em *Avançado (opcional)* você informa o SHA-256 esperado, o Referer e o Cookie.
+**Avançado:** em *Avançado (opcional)* você informa o SHA-256 esperado, o Referer, o Cookie
+e o proxy (por exemplo `http://servidor:8080`).
 **Esc** cancela o download em andamento.
 
 **Retomar:** se o download for cancelado ou interrompido, inicie de novo com a mesma
@@ -93,9 +97,12 @@ No registro, o botão **Limpar** apaga as mensagens exibidas (o arquivo de log n
 
 | Sistema | Local |
 |---|---|
-| Windows | `%APPDATA%\Rajada\config.txt` |
-| macOS | `~/Library/Application Support/Rajada/config.txt` |
-| Linux | `~/.config/Rajada/config.txt` (ou `$XDG_CONFIG_HOME`) |
+| Windows | `%APPDATA%\Rajada\` |
+| macOS | `~/Library/Application Support/Rajada/` |
+| Linux | `~/.config/Rajada/` (ou `$XDG_CONFIG_HOME`) |
+
+Nessa pasta ficam `config.txt` (conexões, limite, pasta, tema, proxy) e `fila.txt`
+(a fila de downloads).
 
 ## Registro de eventos (logs)
 
@@ -155,21 +162,23 @@ cargo test --all-targets
 ./diagnostico.sh        # diagnóstico completo (ver acima)
 ```
 
-Para publicar uma versão, crie uma tag e envie:
+Para publicar uma versão, crie uma tag e envie. O CI cria a release com os binários:
 
 ```bash
-git tag v0.2.0
-git push origin v0.2.0
+git tag v0.4.0
+git push origin v0.4.0
 ```
 
 ### Estrutura
 
 ```
 src/
-├── main.rs       interface gráfica (egui), diálogos e velocidade
+├── main.rs       interface gráfica (egui), diálogos, mapa de partes e velocidade
 ├── engine.rs     motor de download: segmentos, retomada, limite, cancelamento
-├── config.rs     preferências salvas em arquivo de texto
+├── config.rs     preferências e fila salvas em arquivos de texto
 └── registro.rs   registro de eventos em arquivo e captura de pânicos
+assets/           ícone (PNG, ICO e RGBA)
+build.rs          embute o ícone e os dados de versão no .exe do Windows
 ```
 
 O motor não depende da interface, então pode ser reaproveitado em outro programa
@@ -178,7 +187,6 @@ O motor não depende da interface, então pode ser reaproveitado em outro progra
 ## Limitações conhecidas
 
 - A fila é sequencial: não há downloads em paralelo entre itens nem histórico salvo.
-
 - Não suporta sites que geram o link de download via JavaScript ou exigem login por
   navegador.
 - O ganho de velocidade depende do servidor aceitar HTTP Range e de a conexão ter

@@ -80,7 +80,11 @@ struct Limitador {
 
 impl Limitador {
     fn new(taxa_bytes: u64) -> Self {
-        Self { taxa: taxa_bytes, inicio: Instant::now(), consumido: Mutex::new(0) }
+        Self {
+            taxa: taxa_bytes,
+            inicio: Instant::now(),
+            consumido: Mutex::new(0),
+        }
     }
 
     /// Espera o necessário para respeitar o limite. O sono é fatiado para que
@@ -151,7 +155,15 @@ pub fn executar(cfg: &Config, ctl: &Ctl, log: &(dyn Fn(String) + Sync)) -> Res<(
                 cfg.conexoes
             ));
             crate::registro::registrar("INFO", "Modo paralelo");
-            paralelo(&agent, &url_final, &cfg.destino, t, cfg.conexoes, ctl, &limitador)?;
+            paralelo(
+                &agent,
+                &url_final,
+                &cfg.destino,
+                t,
+                cfg.conexoes,
+                ctl,
+                &limitador,
+            )?;
         }
         _ => {
             let motivo = match tamanho {
@@ -175,7 +187,10 @@ pub fn executar(cfg: &Config, ctl: &Ctl, log: &(dyn Fn(String) + Sync)) -> Res<(
     let final_bytes = fs::metadata(&cfg.destino)?.len();
     crate::registro::registrar(
         "INFO",
-        format!("Download concluido: {final_bytes} bytes em {}", cfg.destino.display()),
+        format!(
+            "Download concluido: {final_bytes} bytes em {}",
+            cfg.destino.display()
+        ),
     );
     log(format!(
         "Concluído: {} ({})",
@@ -200,7 +215,10 @@ fn sondar(agent: &ureq::Agent, url: &str) -> Res<(Option<u64>, bool, String)> {
             if let Some(t) = tam {
                 return Ok((Some(t), aceita, r.get_url().to_string()));
             }
-            crate::registro::registrar("WARN", "HEAD sem Content-Length valido; usando GET com Range");
+            crate::registro::registrar(
+                "WARN",
+                "HEAD sem Content-Length valido; usando GET com Range",
+            );
         }
         Err(e) => {
             crate::registro::registrar("WARN", format!("HEAD falhou ({e}); usando GET com Range"));
@@ -258,7 +276,11 @@ fn paralelo(
     for (i, parte) in partes.iter().enumerate() {
         let i = i as u64;
         let ini = i * bloco;
-        let fim = if i == n - 1 { tamanho - 1 } else { ini + bloco - 1 };
+        let fim = if i == n - 1 {
+            tamanho - 1
+        } else {
+            ini + bloco - 1
+        };
         let (agent, url, parte, ctl, limitador, erros) = (
             agent.clone(),
             url.to_string(),
@@ -336,7 +358,9 @@ fn baixar_parte(
                 }
                 crate::registro::registrar(
                     "WARN",
-                    format!("{nome} tentativa {tentativa}/{TENTATIVAS} falhou: {msg}; nova tentativa em breve"),
+                    format!(
+                        "{nome} tentativa {tentativa}/{TENTATIVAS} falhou: {msg}; nova tentativa em breve"
+                    ),
                 );
                 thread::sleep(Duration::from_secs(1u64 << tentativa.min(4)));
             }
@@ -463,13 +487,19 @@ fn sanitizar_nome(nome: &str) -> String {
     const PADRAO: &str = "download.bin";
     const PROIBIDOS: &str = "<>:\"/\\|?*";
     const RESERVADOS: [&str; 22] = [
-        "CON", "PRN", "AUX", "NUL", "COM1", "COM2", "COM3", "COM4", "COM5", "COM6", "COM7",
-        "COM8", "COM9", "LPT1", "LPT2", "LPT3", "LPT4", "LPT5", "LPT6", "LPT7", "LPT8", "LPT9",
+        "CON", "PRN", "AUX", "NUL", "COM1", "COM2", "COM3", "COM4", "COM5", "COM6", "COM7", "COM8",
+        "COM9", "LPT1", "LPT2", "LPT3", "LPT4", "LPT5", "LPT6", "LPT7", "LPT8", "LPT9",
     ];
 
     let limpo: String = nome
         .chars()
-        .map(|c| if PROIBIDOS.contains(c) || c.is_control() { '_' } else { c })
+        .map(|c| {
+            if PROIBIDOS.contains(c) || c.is_control() {
+                '_'
+            } else {
+                c
+            }
+        })
         .collect();
     // Windows não aceita espaço ou ponto no fim do nome.
     let limpo = limpo.trim().trim_end_matches('.');
@@ -543,14 +573,21 @@ mod tests {
                     }
                     let tam = dados.len();
                     let cab = |status: &str, extra: &str, len: usize| {
-                        format!("HTTP/1.1 {status}\r\nContent-Length: {len}\r\n{extra}Connection: close\r\n\r\n")
+                        format!(
+                            "HTTP/1.1 {status}\r\nContent-Length: {len}\r\n{extra}Connection: close\r\n\r\n"
+                        )
                     };
-                    let aceita = if suporta_range { "Accept-Ranges: bytes\r\n" } else { "" };
+                    let aceita = if suporta_range {
+                        "Accept-Ranges: bytes\r\n"
+                    } else {
+                        ""
+                    };
                     if metodo == "HEAD" {
                         let _ = stream.write_all(cab("200 OK", aceita, tam).as_bytes());
                         return;
                     }
-                    let parcial = suporta_range && range.as_deref().is_some_and(|r| r.starts_with("bytes="));
+                    let parcial =
+                        suporta_range && range.as_deref().is_some_and(|r| r.starts_with("bytes="));
                     if parcial {
                         let spec = range.unwrap();
                         let spec = spec.trim_start_matches("bytes=");
@@ -562,8 +599,11 @@ mod tests {
                             .unwrap_or(tam - 1)
                             .min(tam - 1);
                         let corpo = &dados[ini..=fim];
-                        let extra = format!("Accept-Ranges: bytes\r\nContent-Range: bytes {ini}-{fim}/{tam}\r\n");
-                        let _ = stream.write_all(cab("206 Partial Content", &extra, corpo.len()).as_bytes());
+                        let extra = format!(
+                            "Accept-Ranges: bytes\r\nContent-Range: bytes {ini}-{fim}/{tam}\r\n"
+                        );
+                        let _ = stream
+                            .write_all(cab("206 Partial Content", &extra, corpo.len()).as_bytes());
                         let _ = stream.write_all(corpo);
                     } else {
                         let _ = stream.write_all(cab("200 OK", aceita, tam).as_bytes());
@@ -596,7 +636,12 @@ mod tests {
     }
 
     fn cfg(url: String, destino: PathBuf, conexoes: u32, limite: u64) -> Config {
-        Config { url, destino, conexoes, limite_kbps: limite }
+        Config {
+            url,
+            destino,
+            conexoes,
+            limite_kbps: limite,
+        }
     }
 
     fn nao_loga(_: String) {}
@@ -609,8 +654,11 @@ mod tests {
         let destino = dir.join("saida.bin");
         executar(&cfg(url, destino.clone(), 4, 0), &Ctl::default(), &nao_loga).unwrap();
         assert_eq!(fs::read(&destino).unwrap(), *dados);
-        let restos: Vec<_> = fs::read_dir(&dir).unwrap().flatten()
-            .filter(|e| e.file_name().to_string_lossy().contains(".part")).collect();
+        let restos: Vec<_> = fs::read_dir(&dir)
+            .unwrap()
+            .flatten()
+            .filter(|e| e.file_name().to_string_lossy().contains(".part"))
+            .collect();
         assert!(restos.is_empty(), "partes temporárias não foram removidas");
         let _ = fs::remove_dir_all(&dir);
     }
@@ -639,9 +687,18 @@ mod tests {
             let ini = i * bloco;
             let fim = if i == n - 1 { dados.len() } else { ini + bloco };
             let metade = (fim - ini) / 2;
-            fs::write(format!("{}.part{}", destino.display(), i), &dados[ini..ini + metade]).unwrap();
+            fs::write(
+                format!("{}.part{}", destino.display(), i),
+                &dados[ini..ini + metade],
+            )
+            .unwrap();
         }
-        executar(&cfg(url, destino.clone(), n as u32, 0), &Ctl::default(), &nao_loga).unwrap();
+        executar(
+            &cfg(url, destino.clone(), n as u32, 0),
+            &Ctl::default(),
+            &nao_loga,
+        )
+        .unwrap();
         assert_eq!(fs::read(&destino).unwrap(), *dados);
         let _ = fs::remove_dir_all(&dir);
     }
@@ -667,7 +724,10 @@ mod tests {
 
     #[test]
     fn nome_da_url_decodifica_e_ignora_query() {
-        assert_eq!(nome_da_url("https://x.com/pasta/arquivo.zip?token=1"), "arquivo.zip");
+        assert_eq!(
+            nome_da_url("https://x.com/pasta/arquivo.zip?token=1"),
+            "arquivo.zip"
+        );
         assert_eq!(nome_da_url("https://x.com/a%20b.pdf#topo"), "a b.pdf");
         assert_eq!(nome_da_url("https://x.com/"), "download.bin");
     }
@@ -688,7 +748,10 @@ mod tests {
         let inicio = Instant::now();
         let res = executar(&cfg(url, destino, 4, 10), &ctl, &nao_loga);
         assert!(matches!(res, Err(ErroDl::Cancelado)));
-        assert!(inicio.elapsed() < Duration::from_secs(3), "cancelamento demorou demais");
+        assert!(
+            inicio.elapsed() < Duration::from_secs(3),
+            "cancelamento demorou demais"
+        );
         let _ = fs::remove_dir_all(&dir);
     }
 
@@ -698,7 +761,12 @@ mod tests {
         let url = servidor(Arc::clone(&dados), true);
         let dir = pasta_tmp("pequeno");
         let destino = dir.join("saida.bin");
-        executar(&cfg(url, destino.clone(), 32, 0), &Ctl::default(), &nao_loga).unwrap();
+        executar(
+            &cfg(url, destino.clone(), 32, 0),
+            &Ctl::default(),
+            &nao_loga,
+        )
+        .unwrap();
         assert_eq!(fs::read(&destino).unwrap(), *dados);
         let _ = fs::remove_dir_all(&dir);
     }

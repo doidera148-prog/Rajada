@@ -1,12 +1,15 @@
 //! Rajada — interface gráfica (egui).
 //! No Windows, a versão de release não abre a janela de console.
-#![cfg_attr(all(target_os = "windows", not(debug_assertions)), windows_subsystem = "windows")]
+#![cfg_attr(
+    all(target_os = "windows", not(debug_assertions)),
+    windows_subsystem = "windows"
+)]
 
 mod engine;
 mod registro;
 
 use eframe::egui::{self, Color32, RichText};
-use engine::{formatar_bytes, formatar_tempo, nome_da_url, Config, Ctl, ErroDl};
+use engine::{Config, Ctl, ErroDl, formatar_bytes, formatar_tempo, nome_da_url};
 use std::path::{Path, PathBuf};
 use std::sync::atomic::Ordering;
 use std::sync::mpsc::{self, Receiver, TryRecvError};
@@ -78,11 +81,7 @@ fn pasta_padrao() -> PathBuf {
         .map(PathBuf::from)
         .unwrap_or_else(|| PathBuf::from("."));
     let downloads = home.join("Downloads");
-    if downloads.is_dir() {
-        downloads
-    } else {
-        home
-    }
+    if downloads.is_dir() { downloads } else { home }
 }
 
 /// Abre uma pasta no gerenciador de arquivos do sistema.
@@ -95,7 +94,10 @@ fn abrir_pasta(pasta: &Path) {
     let mut comando = std::process::Command::new("xdg-open");
 
     if let Err(e) = comando.arg(pasta).spawn() {
-        registro::registrar("WARN", format!("Não foi possível abrir a pasta {}: {e}", pasta.display()));
+        registro::registrar(
+            "WARN",
+            format!("Não foi possível abrir a pasta {}: {e}", pasta.display()),
+        );
     }
 }
 
@@ -209,8 +211,14 @@ impl App {
                     self.progresso = 1.0;
                     self.ultimo_sucesso = Some(PathBuf::from(&caminho));
                     self.registrar(format!("Salvo em: {caminho}"));
-                    registro::registrar("INFO", format!("Interface: download concluido em {caminho}"));
-                    self.popup = Some(("Concluído".into(), format!("Download concluído:\n{caminho}")));
+                    registro::registrar(
+                        "INFO",
+                        format!("Interface: download concluido em {caminho}"),
+                    );
+                    self.popup = Some((
+                        "Concluído".into(),
+                        format!("Download concluído:\n{caminho}"),
+                    ));
                 }
                 Evento::Falhou(msg) => {
                     self.finalizar();
@@ -222,7 +230,8 @@ impl App {
                 }
                 Evento::Cancelado => {
                     self.finalizar();
-                    self.status = "Cancelado. As partes ficaram salvas; inicie de novo para retomar.".into();
+                    self.status =
+                        "Cancelado. As partes ficaram salvas; inicie de novo para retomar.".into();
                     self.status_cor = Some(COR_AVISO);
                     self.registrar("Download cancelado.".into());
                     registro::registrar("INFO", "Interface: download cancelado pelo usuario");
@@ -250,7 +259,11 @@ impl App {
         if total > 0.0 {
             self.indeterminado = false;
             self.progresso = (baixado / total).clamp(0.0, 1.0) as f32;
-            let restante = if velocidade > 0.0 { (total - baixado) / velocidade } else { 0.0 };
+            let restante = if velocidade > 0.0 {
+                (total - baixado) / velocidade
+            } else {
+                0.0
+            };
             self.status = format!(
                 "{:.1}%  —  {} de {}",
                 self.progresso * 100.0,
@@ -374,7 +387,10 @@ impl App {
                 self.iniciar();
             }
             if ui
-                .add_enabled(self.em_andamento, egui::Button::new("Cancelar").min_size(tamanho))
+                .add_enabled(
+                    self.em_andamento,
+                    egui::Button::new("Cancelar").min_size(tamanho),
+                )
                 .clicked()
             {
                 self.cancelar();
@@ -488,7 +504,9 @@ fn main() -> eframe::Result<()> {
     //   glow     -> renderizador OpenGL
     //   novsync  -> wgpu sem sincronização vertical
     let caminho_log = registro::iniciar();
-    let teste = std::env::var("ACEL_TESTE").unwrap_or_default().to_ascii_lowercase();
+    let teste = std::env::var("ACEL_TESTE")
+        .unwrap_or_default()
+        .to_ascii_lowercase();
     registro::registrar(
         "INFO",
         format!(

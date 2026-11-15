@@ -91,11 +91,36 @@ A variável de ambiente `ACEL_TESTE` escolhe o renderizador gráfico:
 - Windows (cmd): `set ACEL_TESTE=glow` e depois `rajada.exe`
 - Linux/macOS: `ACEL_TESTE=glow ./rajada`
 
+## Diagnóstico automático
+
+O workflow **Diagnóstico e correção automática** (`.github/workflows/diagnostico.yml`)
+roda a cada push e em cada pull request:
+
+- **rustfmt:** verifica a formatação do código.
+- **clippy:** procura bugs prováveis e trechos que podem ser simplificados, tratando avisos como erro.
+- **Testes:** roda todos os testes.
+- **cargo-audit:** verifica vulnerabilidades conhecidas nas dependências.
+
+Em push para o `main`, o mesmo workflow também **aplica as correções mecânicas**
+(`cargo fmt` e `cargo clippy --fix`) e envia o resultado ao `main`, mas só se os testes
+continuarem passando. Se os testes falharem, nada é enviado.
+
+Para rodar o diagnóstico no seu computador:
+
+```bash
+./diagnostico.sh              # só relata os problemas
+./diagnostico.sh --corrigir   # aplica as correções e depois testa
+```
+
+As correções automáticas cobrem formatação e simplificações que o clippy considera seguras.
+Elas não substituem a revisão de regras de negócio nem de comportamento da interface.
+
 ## Desenvolvimento
 
 ```bash
 cargo build --release   # gera o binário em target/release/
 cargo test --release    # roda os testes
+./diagnostico.sh        # diagnóstico completo (ver acima)
 ```
 
 ### Estrutura

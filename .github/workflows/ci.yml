@@ -97,24 +97,30 @@ jobs:
           sudo apt-get update -qq
           sudo apt-get install -y -qq xvfb libgl1 libegl1 libxkbcommon0 libgtk-3-0 >/dev/null
           bin=target/${{ matrix.target }}/release/${{ matrix.binario }}
-          # timeout devolve 124 quando o programa continua rodando, que é o esperado.
+          # Roda os dois renderizadores sempre, para comparar. timeout devolve 124 = rodou sem erro.
           set +e
-          echo "== Renderizador padrão (wgpu)"
-          xvfb-run -a timeout 8 "$bin"
+          xvfb-run -a timeout 8 "$bin" > "$RUNNER_TEMP/wgpu.txt" 2>&1
           padrao=$?
-          echo "== Renderizador OpenGL (glow)"
-          ACEL_TESTE=glow xvfb-run -a timeout 8 "$bin"
+          ACEL_TESTE=glow xvfb-run -a timeout 8 "$bin" > "$RUNNER_TEMP/glow.txt" 2>&1
           glow=$?
           set -e
-          echo "Código: wgpu=$padrao glow=$glow (124 = rodou sem erro)"
+          echo "Código de saída: wgpu=$padrao glow=$glow (124 = rodou sem erro)"
+          for nome in wgpu glow; do
+            echo "===== Saída do $nome (últimas 60 linhas) ====="
+            tail -n 60 "$RUNNER_TEMP/$nome.txt" || true
+          done
+          echo "===== Log do Rajada (últimas 120 linhas) ====="
+          tail -n 120 "$XDG_STATE_HOME/Rajada/logs/rajada.log" 2>/dev/null || echo "(sem log)"
+          falhou=0
           if [ "$padrao" -ne 124 ]; then
-            echo "::error::o programa encerrou cedo com wgpu (código $padrao)"
-            exit 1
+            echo "::error::programa encerrou cedo com wgpu (código $padrao)"
+            falhou=1
           fi
           if [ "$glow" -ne 124 ]; then
-            echo "::error::o programa encerrou cedo com glow (código $glow)"
-            exit 1
+            echo "::error::programa encerrou cedo com glow (código $glow)"
+            falhou=1
           fi
+          exit $falhou
 
       - name: Guardar log do teste de fumaça
         if: matrix.os == 'ubuntu-latest' && steps.fumaca.outcome == 'failure'

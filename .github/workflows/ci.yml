@@ -95,7 +95,7 @@ jobs:
           XDG_STATE_HOME: ${{ runner.temp }}/estado
         run: |
           sudo apt-get update -qq
-          sudo apt-get install -y -qq xvfb libgl1 libegl1 libxkbcommon0 libgtk-3-0 >/dev/null
+          sudo apt-get install -y -qq xvfb libgl1 libgl1-mesa-dri libglx-mesa0 libegl1 libegl-mesa0 mesa-vulkan-drivers libxkbcommon0 libgtk-3-0 >/dev/null
           bin=target/${{ matrix.target }}/release/${{ matrix.binario }}
           # Roda os dois renderizadores sempre, para comparar. timeout devolve 124 = rodou sem erro.
           set +e
@@ -111,6 +111,12 @@ jobs:
           done
           echo "===== Log do Rajada (últimas 120 linhas) ====="
           tail -n 120 "$XDG_STATE_HOME/Rajada/logs/rajada.log" 2>/dev/null || echo "(sem log)"
+          for nome in wgpu glow; do
+            linha=$(grep -m1 -A2 "panicked" "$RUNNER_TEMP/$nome.txt" | tr '\n' ' ' || true)
+            if [ -n "$linha" ]; then
+              echo "::error title=pânico no $nome::$linha"
+            fi
+          done
           falhou=0
           if [ "$padrao" -ne 124 ]; then
             echo "::error::programa encerrou cedo com wgpu (código $padrao)"

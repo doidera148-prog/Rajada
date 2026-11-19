@@ -86,21 +86,43 @@ jobs:
         run: cargo test --release --target ${{ matrix.target }}
 
       - name: Teste de fumaça (a janela abre sem erro)
+        id: fumaca
         if: matrix.os == 'ubuntu-latest'
-        # Aviso, não bloqueia: o runner pode não ter renderização gráfica.
+        # Aviso, não bloqueia. Roda com o renderizador padrão (wgpu) e com o OpenGL (glow).
         continue-on-error: true
+        env:
+          # O log do programa vai para uma pasta própria, guardada como artefato se falhar.
+          XDG_STATE_HOME: ${{ runner.temp }}/estado
         run: |
           sudo apt-get update -qq
           sudo apt-get install -y -qq xvfb libgl1 libegl1 libxkbcommon0 libgtk-3-0 >/dev/null
+          bin=target/${{ matrix.target }}/release/${{ matrix.binario }}
           # timeout devolve 124 quando o programa continua rodando, que é o esperado.
           set +e
-          xvfb-run -a timeout 8 target/${{ matrix.target }}/release/${{ matrix.binario }}
-          codigo=$?
+          echo "== Renderizador padrão (wgpu)"
+          xvfb-run -a timeout 8 "$bin"
+          padrao=$?
+          echo "== Renderizador OpenGL (glow)"
+          ACEL_TESTE=glow xvfb-run -a timeout 8 "$bin"
+          glow=$?
           set -e
-          if [ "$codigo" -ne 124 ]; then
-            echo "::error::o programa encerrou cedo (código $codigo)"
+          echo "Código: wgpu=$padrao glow=$glow (124 = rodou sem erro)"
+          if [ "$padrao" -ne 124 ]; then
+            echo "::error::o programa encerrou cedo com wgpu (código $padrao)"
             exit 1
           fi
+          if [ "$glow" -ne 124 ]; then
+            echo "::error::o programa encerrou cedo com glow (código $glow)"
+            exit 1
+          fi
+
+      - name: Guardar log do teste de fumaça
+        if: matrix.os == 'ubuntu-latest' && steps.fumaca.outcome == 'failure'
+        uses: actions/upload-artifact@v4
+        with:
+          name: log-fumaca
+          path: ${{ runner.temp }}/estado/Rajada/logs/
+          if-no-files-found: warn
 
       - name: Preparar binário
         shell: bash

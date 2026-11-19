@@ -117,6 +117,14 @@ struct App {
     atual: Option<(String, PathBuf)>,
     /// Velocidade atual em bytes por segundo, para a barra de status.
     velocidade: f64,
+    /// Últimas velocidades (uma por atualização), para o gráfico.
+    velocidades: VecDeque<f32>,
+    /// Última vez que a área de transferência foi lida.
+    ultimo_check: Option<Instant>,
+    /// URL copiada na área de transferência, oferecida ao usuário.
+    sugestao: Option<String>,
+    /// URL que o usuário dispensou; não é oferecida de novo.
+    sugestao_ignorada: Option<String>,
     /// Começa o próximo item da fila quando o atual termina.
     avancar_fila: bool,
     /// (instante, bytes baixados) para calcular a velocidade recente.
@@ -162,6 +170,10 @@ impl App {
             historico: Vec::new(),
             atual: None,
             velocidade: 0.0,
+            velocidades: VecDeque::new(),
+            ultimo_check: None,
+            sugestao: None,
+            sugestao_ignorada: None,
             avancar_fila: false,
             amostras: VecDeque::new(),
             mapa: Vec::new(),
@@ -412,6 +424,7 @@ impl App {
         self.detalhes.clear();
         self.ultimo_sucesso = None;
         self.atual = Some((url.clone(), PathBuf::from(&self.destino)));
+        self.velocidades.clear();
         self.amostras.clear();
         self.mapa.clear();
         self.ctl = Some(ctl);
@@ -630,6 +643,10 @@ impl App {
         };
 
         self.velocidade = velocidade;
+        self.velocidades.push_back(velocidade as f32);
+        while self.velocidades.len() > 300 {
+            self.velocidades.pop_front();
+        }
         if total > 0 {
             self.indeterminado = false;
             self.progresso = (baixado as f64 / total as f64).clamp(0.0, 1.0) as f32;
@@ -669,6 +686,100 @@ impl App {
         {
             self.pasta = caminho.parent().map(|p| p.display().to_string());
             self.destino = caminho.display().to_string();
+        }
+    }
+
+    /// Lê a área de transferência de tempo em tempo e oferece uma URL copiada.
+    fn verificar_area_transferencia(&mut self) {
+        let livre =
+            self.url.trim().is_empty() && !self.em_andamento && self.pagina == Pagina::Baixar;
+        if !livre {
+            self.sugestao = None;
+            return;
+        }
+        let agora = Instant::now();
+        if self
+            .ultimo_check
+            .is_some_and(|t| agora.duration_since(t) < Duration::from_secs(2))
+        {
+            return;
+        }
+        self.ultimo_check = Some(agora);
+        let Ok(texto) = arboard::Clipboard::new().and_then(|mut c| c.get_text()) else {
+            return;
+        };
+        let texto = texto.trim();
+        let parece_url = (texto.starts_with("http://") || texto.starts_with("https://"))
+            && !texto.contains(char::is_whitespace);
+        self.sugestao = if parece_url && self.sugestao_ignorada.as_deref() != Some(texto) {
+            Some(texto.to_string())
+        } else {
+            None
+        };
+    }
+
+    /// Banner com a URL copiada: usar no campo ou dispensar.
+    fn desenhar_sugestao(&mut self, ui: &mut egui::Ui) {
+        let Some(sugestao) = self.sugestao.clone() else {
+            return;
+        };
+        ui.horizontal(|ui| {
+            ui.label(RichText::new("URL copiada:").small());
+            ui.label(RichText::new(&sugestao).small().strong());
+            if ui.small_button("Usar").clicked() {
+                self.url = sugestao.clone();
+                self.sugestao = None;
+            }
+            if ui.small_button("Ignorar").clicked() {
+                self.sugestao_ignorada = Some(sugestao.clone());
+                self.sugestao = None;
+            }
+        });
+        ui.add_space(4.0);
+    }
+
+    /// Adiciona à fila as URLs de um arquivo de texto solto na janela.
+    fn adicionar_urls_de_arquivo(&mut self, caminho: &Path) {
+        match std::fs::read_to_string(caminho) {
+            Ok(texto) => {
+                let urls: Vec<String> = texto
+                    .lines()
+                    .map(str::trim)
+                    .filter(|l| l.starts_with("http://") || l.starts_with("https://"))
+                    .map(str::to_string)
+                    .collect();
+                if urls.is_empty() {
+                    self.registrar(format!("Nenhuma URL encontrada em {}", caminho.display()));
+                    return;
+                }
+                let total = urls.len();
+                self.fila.extend(urls);
+                self.persistir_fila();
+                self.pagina = Pagina::Fila;
+                self.registrar(format!(
+                    "{total} URL(s) adicionadas à fila a partir de {}",
+                    caminho.display()
+                ));
+            }
+            Err(e) => self.registrar(format!(
+                "ERRO: não foi possível ler {}: {e}",
+                caminho.display()
+            )),
+        }
+    }
+
+    /// Recebe os arquivos soltos na janela.
+    fn receber_arquivos_soltos(&mut self, ctx: &egui::Context) {
+        let soltos: Vec<PathBuf> = ctx.input(|i| {
+            i.raw
+                .dropped_files
+                .iter()
+                .map(|f| f.path().to_path_buf())
+                .filter(|p| !p.as_os_str().is_empty())
+                .collect()
+        });
+        for caminho in soltos {
+            self.adicionar_urls_de_arquivo(&caminho);
         }
     }
 
@@ -764,7 +875,10 @@ impl App {
                         .file_name()
                         .map(|n| n.to_string_lossy().into_owned())
                         .unwrap_or_default();
-                    ui.label(RichText::new(nome).strong());
+                    ui.label(RichText::new(&nome).strong());
+                    if let Some(tipo) = tipo_do_arquivo(&nome) {
+                        ui.label(RichText::new(tipo).small().color(ACENTO));
+                    }
                     if let Some(pasta) = entrada.arquivo.parent()
                         && ui.small_button("Abrir pasta").clicked()
                     {
@@ -824,6 +938,7 @@ impl App {
     /// Cartão de download: URL, destino e botões principais.
     fn desenhar_download(&mut self, ui: &mut egui::Ui) {
         cartao(ui, "Download", |ui| {
+            self.desenhar_sugestao(ui);
             egui::Grid::new("grade_entrada")
                 .num_columns(2)
                 .spacing([10.0, 8.0])
@@ -860,7 +975,14 @@ impl App {
                     .file_name()
                     .map(|n| n.to_string_lossy().into_owned())
                     .unwrap_or_default();
-                ui.label(RichText::new(format!("Arquivo: {nome}")).weak().small());
+                let tipo = tipo_do_arquivo(&nome)
+                    .map(|t| format!("  ·  {t}"))
+                    .unwrap_or_default();
+                ui.label(
+                    RichText::new(format!("Arquivo: {nome}{tipo}"))
+                        .weak()
+                        .small(),
+                );
             }
             self.desenhar_info(ui);
 
@@ -995,6 +1117,11 @@ impl App {
                 ui.add_space(6.0);
                 ui.label(RichText::new("Partes").weak().small());
                 desenhar_mapa(ui, &self.mapa);
+            }
+            if self.velocidades.len() > 1 {
+                ui.add_space(6.0);
+                ui.label(RichText::new("Velocidade").weak().small());
+                desenhar_sparkline(ui, &self.velocidades);
             }
         });
     }
@@ -1191,6 +1318,8 @@ impl eframe::App for App {
 
         self.processar_eventos(ctx);
         self.processar_verificacao();
+        self.verificar_area_transferencia();
+        self.receber_arquivos_soltos(ctx);
         if self.verificacao.is_some() {
             ctx.request_repaint_after(Duration::from_millis(100));
         }
@@ -1249,6 +1378,20 @@ impl eframe::App for App {
                     }
                 });
         });
+
+        if ctx.input(|i| !i.raw.hovered_files.is_empty()) {
+            egui::Area::new(egui::Id::unique("soltar"))
+                .anchor(egui::Align2::CENTER_CENTER, [0.0, 0.0])
+                .order(egui::Order::Foreground)
+                .show(&ctx, |ui| {
+                    egui::Frame::popup(ui.style()).show(ui, |ui| {
+                        ui.label(
+                            RichText::new("Solte um arquivo .txt com URLs para adicionar à fila")
+                                .strong(),
+                        );
+                    });
+                });
+        }
 
         if let Some(acao) = self.desenhar_dialogo(&ctx) {
             self.aplicar_acao(acao);
@@ -1326,4 +1469,50 @@ fn main() -> eframe::Result<()> {
             .show();
     }
     resultado
+}
+
+/// Gráfico de linha com as últimas velocidades, escalado pelo maior valor.
+fn desenhar_sparkline(ui: &mut egui::Ui, amostras: &VecDeque<f32>) {
+    let largura = ui.available_width().max(80.0);
+    let altura = 40.0_f32;
+    let (resposta, pintor) = ui.allocate_painter(egui::vec2(largura, altura), egui::Sense::hover());
+    let maximo = amostras.iter().copied().fold(0.0_f32, f32::max).max(1.0);
+    let n = amostras.len();
+    let base = resposta.rect.bottom();
+    let pontos: Vec<egui::Pos2> = amostras
+        .iter()
+        .enumerate()
+        .map(|(i, v)| {
+            let x = resposta.rect.left() + largura * i as f32 / (n - 1) as f32;
+            egui::pos2(x, base - altura * (v / maximo))
+        })
+        .collect();
+    pintor.add(egui::Shape::line(pontos, egui::Stroke::new(2.0, ACENTO)));
+}
+
+/// Tipo do arquivo pela extensão, para o selo na interface.
+fn tipo_do_arquivo(nome: &str) -> Option<&'static str> {
+    let ext = nome.rsplit_once('.')?.1.to_ascii_lowercase();
+    Some(match ext.as_str() {
+        "zip" | "rar" | "7z" | "tar" | "gz" | "xz" => "Compactado",
+        "mp4" | "mkv" | "avi" | "mov" | "webm" => "Vídeo",
+        "mp3" | "flac" | "wav" | "ogg" | "m4a" => "Áudio",
+        "pdf" | "doc" | "docx" | "odt" | "txt" | "xls" | "xlsx" => "Documento",
+        "exe" | "msi" | "dmg" | "deb" | "appimage" | "apk" => "Programa",
+        "iso" | "img" => "Imagem de disco",
+        "jpg" | "jpeg" | "png" | "gif" | "webp" => "Imagem",
+        _ => return None,
+    })
+}
+
+#[cfg(test)]
+mod tests {
+    use super::tipo_do_arquivo;
+
+    #[test]
+    fn tipo_pela_extensao() {
+        assert_eq!(tipo_do_arquivo("filme.MKV"), Some("Vídeo"));
+        assert_eq!(tipo_do_arquivo("dados.bin"), None);
+        assert_eq!(tipo_do_arquivo("semextensao"), None);
+    }
 }

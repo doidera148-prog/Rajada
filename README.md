@@ -40,6 +40,10 @@ conexões paralelas. Escrito em Rust, roda no **Windows**, **Linux** e **macOS**
 - **Barra lateral:** páginas Baixar, Fila e Histórico, com contadores.
 - **Histórico da sessão:** lista os downloads concluídos, cancelados e com falha, com botão para abrir a pasta.
 - **Barra de status:** mostra downloads ativos, itens na fila e a velocidade atual.
+- **Gráfico de velocidade:** mostra a velocidade dos últimos segundos do download.
+- **URL copiada:** quando a área de transferência tem uma URL e o campo está vazio, o programa oferece usá-la.
+- **Soltar arquivo de URLs:** arraste um arquivo `.txt` com uma URL por linha para a janela; as URLs entram na fila.
+- **Tipo do arquivo:** selo com o tipo (Vídeo, Compactado, Programa...) pela extensão.
 - **Mensagens de erro claras:** explica falhas de rede, acesso negado e arquivo não encontrado.
 
 ## Instalação

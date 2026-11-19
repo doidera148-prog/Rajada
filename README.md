@@ -37,6 +37,9 @@ conexões paralelas. Escrito em Rust, roda no **Windows**, **Linux** e **macOS**
 - **Proxy HTTP/HTTPS** (opcional, em *Avançado*).
 - **Fila salva:** os itens da fila continuam lá se você fechar o programa.
 - **Verificar arquivo:** mostra o tamanho e se o servidor aceita partes, sem baixar.
+- **Barra lateral:** páginas Baixar, Fila e Histórico, com contadores.
+- **Histórico da sessão:** lista os downloads concluídos, cancelados e com falha, com botão para abrir a pasta.
+- **Barra de status:** mostra downloads ativos, itens na fila e a velocidade atual.
 - **Mensagens de erro claras:** explica falhas de rede, acesso negado e arquivo não encontrado.
 
 ## Instalação

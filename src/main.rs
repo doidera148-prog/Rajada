@@ -65,6 +65,29 @@ enum Acao {
     ContinuarBaixando,
 }
 
+/// Página mostrada na área principal.
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum Pagina {
+    Baixar,
+    Fila,
+    Historico,
+}
+
+/// Como um download terminou.
+#[derive(Clone)]
+enum EstadoEntrada {
+    Concluido,
+    Falhou(String),
+    Cancelado,
+}
+
+/// Download que terminou nesta sessão, mostrado no histórico.
+struct Entrada {
+    url: String,
+    arquivo: PathBuf,
+    estado: EstadoEntrada,
+}
+
 struct App {
     url: String,
     destino: String,
@@ -88,6 +111,12 @@ struct App {
     rx: Option<Receiver<Evento>>,
     /// Fecha a janela assim que o download cancelado terminar.
     fechar_ao_terminar: bool,
+    pagina: Pagina,
+    historico: Vec<Entrada>,
+    /// URL e destino do download atual, para registrar no histórico.
+    atual: Option<(String, PathBuf)>,
+    /// Velocidade atual em bytes por segundo, para a barra de status.
+    velocidade: f64,
     /// Começa o próximo item da fila quando o atual termina.
     avancar_fila: bool,
     /// (instante, bytes baixados) para calcular a velocidade recente.
@@ -129,6 +158,10 @@ impl App {
             ctl: None,
             rx: None,
             fechar_ao_terminar: false,
+            pagina: Pagina::Baixar,
+            historico: Vec::new(),
+            atual: None,
+            velocidade: 0.0,
             avancar_fila: false,
             amostras: VecDeque::new(),
             mapa: Vec::new(),
@@ -378,6 +411,7 @@ impl App {
         self.status_cor = None;
         self.detalhes.clear();
         self.ultimo_sucesso = None;
+        self.atual = Some((url.clone(), PathBuf::from(&self.destino)));
         self.amostras.clear();
         self.mapa.clear();
         self.ctl = Some(ctl);
@@ -488,6 +522,7 @@ impl App {
                 Evento::Log(m) => self.registrar(m),
                 Evento::Concluido(caminho) => {
                     self.finalizar();
+                    self.registrar_historico(EstadoEntrada::Concluido);
                     self.status = "Download concluído.".into();
                     self.status_cor = Some(COR_SUCESSO);
                     self.progresso = 1.0;
@@ -507,6 +542,7 @@ impl App {
                 }
                 Evento::Falhou(msg) => {
                     self.finalizar();
+                    self.registrar_historico(EstadoEntrada::Falhou(msg.clone()));
                     self.status = "Falhou. Veja os detalhes no registro.".into();
                     self.status_cor = Some(COR_ERRO);
                     self.registrar(format!("ERRO: {msg}"));
@@ -522,6 +558,7 @@ impl App {
                 }
                 Evento::Cancelado => {
                     self.finalizar();
+                    self.registrar_historico(EstadoEntrada::Cancelado);
                     self.status =
                         "Cancelado. Inicie de novo para retomar, se o servidor permitir.".into();
                     self.status_cor = Some(COR_AVISO);
@@ -558,6 +595,7 @@ impl App {
 
     fn finalizar(&mut self) {
         self.em_andamento = false;
+        self.velocidade = 0.0;
         self.indeterminado = false;
         self.ctl = None;
         self.rx = None;
@@ -591,6 +629,7 @@ impl App {
             _ => 0.0,
         };
 
+        self.velocidade = velocidade;
         if total > 0 {
             self.indeterminado = false;
             self.progresso = (baixado as f64 / total as f64).clamp(0.0, 1.0) as f32;
@@ -631,6 +670,117 @@ impl App {
             self.pasta = caminho.parent().map(|p| p.display().to_string());
             self.destino = caminho.display().to_string();
         }
+    }
+
+    /// Guarda o download atual no histórico da sessão.
+    fn registrar_historico(&mut self, estado: EstadoEntrada) {
+        if let Some((url, arquivo)) = self.atual.take() {
+            self.historico.push(Entrada {
+                url,
+                arquivo,
+                estado,
+            });
+        }
+    }
+
+    /// Barra lateral: páginas com contadores e resumo rápido.
+    fn desenhar_menu(&mut self, ui: &mut egui::Ui) {
+        ui.add_space(8.0);
+        let itens = [
+            (Pagina::Baixar, "Baixar".to_string()),
+            (Pagina::Fila, format!("Fila ({})", self.fila.len())),
+            (
+                Pagina::Historico,
+                format!("Histórico ({})", self.historico.len()),
+            ),
+        ];
+        for (pagina, rotulo) in itens {
+            if ui.selectable_label(self.pagina == pagina, rotulo).clicked() {
+                self.pagina = pagina;
+            }
+        }
+        ui.add_space(12.0);
+        ui.separator();
+        let ativos = if self.em_andamento { 1 } else { 0 };
+        ui.label(RichText::new(format!("Ativos: {ativos}")).weak().small());
+        ui.label(
+            RichText::new(format!("Concluídos: {}", self.contar(true)))
+                .weak()
+                .small(),
+        );
+        ui.label(
+            RichText::new(format!("Falhas: {}", self.contar(false)))
+                .weak()
+                .small(),
+        );
+    }
+
+    /// Quantos itens do histórico terminaram com sucesso (`true`) ou não (`false`).
+    fn contar(&self, sucesso: bool) -> usize {
+        self.historico
+            .iter()
+            .filter(|e| matches!(e.estado, EstadoEntrada::Concluido) == sucesso)
+            .count()
+    }
+
+    /// Barra inferior: estado do download, fila e velocidade.
+    fn desenhar_barra_status(&self, ui: &mut egui::Ui) {
+        ui.horizontal(|ui| {
+            let estado = if self.em_andamento {
+                "1 download ativo"
+            } else {
+                "nenhum download ativo"
+            };
+            ui.label(RichText::new(estado).small());
+            ui.separator();
+            ui.label(RichText::new(format!("Fila: {}", self.fila.len())).small());
+            ui.separator();
+            let velocidade = if self.em_andamento {
+                format!("{}/s", formatar_bytes(self.velocidade))
+            } else {
+                "—".into()
+            };
+            ui.label(RichText::new(format!("Velocidade: {velocidade}")).small());
+        });
+    }
+
+    /// Página de histórico: downloads terminados nesta sessão.
+    fn desenhar_historico(&mut self, ui: &mut egui::Ui) {
+        cartao(ui, "Histórico desta sessão", |ui| {
+            if self.historico.is_empty() {
+                ui.label(RichText::new("Nenhum download terminou nesta sessão ainda.").weak());
+                return;
+            }
+            for entrada in self.historico.iter().rev() {
+                let (rotulo, cor) = match &entrada.estado {
+                    EstadoEntrada::Concluido => ("Concluído", COR_SUCESSO),
+                    EstadoEntrada::Falhou(_) => ("Falhou", COR_ERRO),
+                    EstadoEntrada::Cancelado => ("Cancelado", COR_AVISO),
+                };
+                ui.horizontal(|ui| {
+                    ui.label(RichText::new(rotulo).color(cor).strong().small());
+                    let nome = entrada
+                        .arquivo
+                        .file_name()
+                        .map(|n| n.to_string_lossy().into_owned())
+                        .unwrap_or_default();
+                    ui.label(RichText::new(nome).strong());
+                    if let Some(pasta) = entrada.arquivo.parent()
+                        && ui.small_button("Abrir pasta").clicked()
+                    {
+                        abrir_pasta(pasta);
+                    }
+                });
+                ui.label(RichText::new(&entrada.url).weak().small());
+                if let EstadoEntrada::Falhou(msg) = &entrada.estado {
+                    ui.label(RichText::new(msg).small().color(COR_ERRO));
+                }
+                ui.separator();
+            }
+            if ui.small_button("Limpar histórico").clicked() {
+                self.historico.clear();
+            }
+        });
     }
 
     /// Cabeçalho: ícone, título e ações rápidas (tema, logs e sobre).
@@ -1060,20 +1210,43 @@ impl eframe::App for App {
             self.icone = Some(ctx.load_texture("icone", imagem, egui::TextureOptions::LINEAR));
         }
 
+        egui::Panel::bottom("barra_status").show(ui, |ui| {
+            self.desenhar_barra_status(ui);
+        });
+        egui::Panel::left("menu")
+            .resizable(false)
+            .exact_size(150.0)
+            .show(ui, |ui| {
+                self.desenhar_menu(ui);
+            });
         egui::CentralPanel::default().show(ui, |ui| {
             egui::ScrollArea::vertical()
                 .auto_shrink([false, false])
                 .show(ui, |ui| {
                     self.desenhar_cabecalho(ui);
-                    self.desenhar_download(ui);
-                    ui.add_space(6.0);
-                    self.desenhar_opcoes(ui);
-                    ui.add_space(6.0);
-                    self.desenhar_status(ui);
-                    ui.add_space(6.0);
-                    self.desenhar_fila(ui);
-                    ui.add_space(6.0);
-                    self.desenhar_registro(ui);
+                    match self.pagina {
+                        Pagina::Baixar => {
+                            self.desenhar_download(ui);
+                            ui.add_space(6.0);
+                            self.desenhar_opcoes(ui);
+                            ui.add_space(6.0);
+                            self.desenhar_status(ui);
+                            ui.add_space(6.0);
+                            self.desenhar_registro(ui);
+                        }
+                        Pagina::Fila => {
+                            if self.fila.is_empty() {
+                                ui.label(
+                                    RichText::new(
+                                        "A fila está vazia. Adicione URLs pela página Baixar.",
+                                    )
+                                    .weak(),
+                                );
+                            }
+                            self.desenhar_fila(ui);
+                        }
+                        Pagina::Historico => self.desenhar_historico(ui),
+                    }
                 });
         });
 

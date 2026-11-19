@@ -85,6 +85,21 @@ jobs:
       - name: Rodar testes
         run: cargo test --release --target ${{ matrix.target }}
 
+      - name: Teste de fumaça (a janela abre sem erro)
+        if: matrix.os == 'ubuntu-latest'
+        run: |
+          sudo apt-get update -qq
+          sudo apt-get install -y -qq xvfb libgl1 libegl1 libxkbcommon0 libgtk-3-0 >/dev/null
+          # timeout devolve 124 quando o programa continua rodando, que é o esperado.
+          set +e
+          xvfb-run -a timeout 8 target/${{ matrix.target }}/release/${{ matrix.binario }}
+          codigo=$?
+          set -e
+          if [ "$codigo" -ne 124 ]; then
+            echo "::error::o programa encerrou cedo (código $codigo)"
+            exit 1
+          fi
+
       - name: Preparar binário
         shell: bash
         run: |

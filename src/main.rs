@@ -11,7 +11,9 @@ mod registro;
 
 use config::Preferencias;
 use eframe::egui::{self, Color32, RichText, ViewportCommand};
-use engine::{Config, Ctl, ErroDl, formatar_bytes, formatar_tempo, nome_da_url, sha_valido};
+use engine::{
+    Config, Ctl, ErroDl, Info, consultar, formatar_bytes, formatar_tempo, nome_da_url, sha_valido,
+};
 use std::collections::VecDeque;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
@@ -101,6 +103,10 @@ struct App {
     registro: Vec<String>,
     dialogo: Dialogo,
     ultimo_sucesso: Option<PathBuf>,
+    /// Verificação em andamento (tamanho e suporte a partes), em segundo plano.
+    verificacao: Option<Receiver<(String, Result<Info, String>)>>,
+    /// Último resultado da verificação, com a URL a que se refere.
+    info: Option<(String, Result<Info, String>)>,
 }
 
 impl App {
@@ -134,6 +140,8 @@ impl App {
             registro: Vec::new(),
             dialogo: Dialogo::Nenhum,
             ultimo_sucesso: None,
+            verificacao: None,
+            info: None,
         }
     }
 
@@ -374,6 +382,75 @@ impl App {
         self.mapa.clear();
         self.ctl = Some(ctl);
         self.rx = Some(rx);
+    }
+
+    /// Consulta o servidor em segundo plano, sem baixar o arquivo.
+    fn verificar_arquivo(&mut self) {
+        let url = self.url.trim().to_string();
+        let cabecalhos = self.cabecalhos();
+        let proxy = (!self.proxy.trim().is_empty()).then(|| self.proxy.trim().to_string());
+        let (tx, rx) = mpsc::channel();
+        thread::spawn(move || {
+            let resultado =
+                consultar(&url, &cabecalhos, proxy.as_deref()).map_err(|e| e.to_string());
+            let _ = tx.send((url, resultado));
+        });
+        self.verificacao = Some(rx);
+    }
+
+    /// Recebe o resultado da verificação, se já chegou.
+    fn processar_verificacao(&mut self) {
+        let Some(rx) = &self.verificacao else { return };
+        match rx.try_recv() {
+            Ok(resultado) => {
+                self.info = Some(resultado);
+                self.verificacao = None;
+            }
+            Err(TryRecvError::Empty) => {}
+            Err(TryRecvError::Disconnected) => self.verificacao = None,
+        }
+    }
+
+    /// Mostra o resultado da verificação, se for da URL atual.
+    fn desenhar_info(&self, ui: &mut egui::Ui) {
+        if self.verificacao.is_some() {
+            ui.label(RichText::new("Verificando o servidor…").weak().small());
+            return;
+        }
+        let Some((url, resultado)) = &self.info else {
+            return;
+        };
+        if *url != self.url.trim() {
+            return;
+        }
+        match resultado {
+            Ok(info) => {
+                let tamanho = info
+                    .tamanho
+                    .map(|t| formatar_bytes(t as f64))
+                    .unwrap_or_else(|| "desconhecido".into());
+                let partes = if info.aceita_partes {
+                    "aceita download em partes"
+                } else {
+                    "não aceita partes: baixa em uma conexão"
+                };
+                ui.label(
+                    RichText::new(format!("Tamanho: {tamanho} · {partes}"))
+                        .small()
+                        .color(COR_SUCESSO),
+                );
+                if info.url_final != *url {
+                    ui.label(
+                        RichText::new(format!("Redirecionado para: {}", info.url_final))
+                            .weak()
+                            .small(),
+                    );
+                }
+            }
+            Err(msg) => {
+                ui.label(RichText::new(msg).small().color(COR_ERRO));
+            }
+        }
     }
 
     fn cancelar(&mut self) {
@@ -635,6 +712,7 @@ impl App {
                     .unwrap_or_default();
                 ui.label(RichText::new(format!("Arquivo: {nome}")).weak().small());
             }
+            self.desenhar_info(ui);
 
             ui.add_space(6.0);
             ui.horizontal(|ui| {
@@ -654,6 +732,18 @@ impl App {
                     .clicked()
                 {
                     self.cancelar();
+                }
+                if ui
+                    .add_enabled(
+                        self.validar().is_none()
+                            && !self.em_andamento
+                            && self.verificacao.is_none(),
+                        egui::Button::new("Verificar arquivo").min_size(egui::vec2(130.0, 32.0)),
+                    )
+                    .on_hover_text("Mostra o tamanho e se o servidor aceita partes, sem baixar")
+                    .clicked()
+                {
+                    self.verificar_arquivo();
                 }
                 if ui
                     .add_enabled(
@@ -950,6 +1040,10 @@ impl eframe::App for App {
         }
 
         self.processar_eventos(ctx);
+        self.processar_verificacao();
+        if self.verificacao.is_some() {
+            ctx.request_repaint_after(Duration::from_millis(100));
+        }
         if self.em_andamento {
             self.atualizar_progresso();
             ctx.request_repaint_after(Duration::from_millis(100));

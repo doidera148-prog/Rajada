@@ -36,6 +36,8 @@ conexões paralelas. Escrito em Rust, roda no **Windows**, **Linux** e **macOS**
 - **Mapa de partes:** cada quadrado mostra um segmento; os concluídos ficam azuis.
 - **Proxy HTTP/HTTPS** (opcional, em *Avançado*).
 - **Fila salva:** os itens da fila continuam lá se você fechar o programa.
+- **Verificar arquivo:** mostra o tamanho e se o servidor aceita partes, sem baixar.
+- **Mensagens de erro claras:** explica falhas de rede, acesso negado e arquivo não encontrado.
 
 ## Instalação
 

@@ -85,11 +85,50 @@ impl From<ureq::Error> for ErroDl {
     fn from(e: ureq::Error) -> Self {
         match e {
             // 408, 429 e 5xx são temporários; o resto (404, 403...) não adianta repetir.
-            ureq::Error::Status(code, _) if !(code == 408 || code == 429 || code >= 500) => {
-                ErroDl::Permanente(format!("HTTP {code}"))
+            ureq::Error::Status(code, _) => {
+                let msg = explicar_status(code);
+                if code == 408 || code == 429 || code >= 500 {
+                    ErroDl::Outro(msg)
+                } else {
+                    ErroDl::Permanente(msg)
+                }
             }
-            outro => ErroDl::Outro(outro.to_string()),
+            ureq::Error::Transport(t) => ErroDl::Outro(explicar_transporte(&t)),
         }
+    }
+}
+
+/// Mensagem em português para um código HTTP de erro.
+fn explicar_status(code: u16) -> String {
+    let texto = match code {
+        400 => "o servidor recusou a requisição",
+        401 | 403 => {
+            "acesso negado: o site pede login ou permissão (use Cookie ou Referer em Avançado)"
+        }
+        404 | 410 => "arquivo não encontrado no servidor; confira a URL",
+        408 => "o servidor demorou demais para responder",
+        429 => "o servidor limitou os pedidos; tente mais tarde",
+        500..=599 => "o servidor está com problemas; tente mais tarde",
+        _ => "o servidor recusou o download",
+    };
+    format!("HTTP {code}: {texto}")
+}
+
+/// Mensagem em português para falhas de conexão (DNS, rede, proxy, URL).
+fn explicar_transporte(t: &ureq::Transport) -> String {
+    use ureq::ErrorKind as K;
+    match t.kind() {
+        K::Dns => "endereço do servidor não encontrado; confira a URL e a conexão".into(),
+        K::ConnectionFailed => {
+            "não foi possível conectar ao servidor; verifique a conexão ou o proxy".into()
+        }
+        K::TooManyRedirects => "o site redirecionou demais; confira a URL".into(),
+        K::InvalidUrl | K::UnknownScheme => "URL inválida; use http:// ou https://".into(),
+        K::Io => "conexão interrompida ou sem resposta (tempo esgotado); tente de novo".into(),
+        K::ProxyConnect | K::InvalidProxyUrl | K::ProxyUnauthorized => {
+            "não foi possível usar o proxy informado".into()
+        }
+        _ => t.to_string(),
     }
 }
 
@@ -422,11 +461,54 @@ fn com_cabecalhos(req: ureq::Request, cabecalhos: &[(String, String)]) -> ureq::
 /// Executa o download. `log` recebe mensagens de status.
 /// Em caso de sucesso, o arquivo final está em `cfg.destino`.
 pub fn executar(cfg: &Config, ctl: &Ctl, log: &(dyn Fn(String) + Sync)) -> Res<()> {
-    executar_interno(cfg, ctl, log).map_err(|e| match e {
-        ErroDl::Outro(m) => ErroDl::Outro(limpar(&m, &cfg.url)),
-        ErroDl::Permanente(m) => ErroDl::Permanente(limpar(&m, &cfg.url)),
+    executar_interno(cfg, ctl, log).map_err(|e| limpar_erro(e, &cfg.url))
+}
+
+/// Tira a URL (com credenciais e query) das mensagens de erro.
+fn limpar_erro(e: ErroDl, url: &str) -> ErroDl {
+    match e {
+        ErroDl::Outro(m) => ErroDl::Outro(limpar(&m, url)),
+        ErroDl::Permanente(m) => ErroDl::Permanente(limpar(&m, url)),
         outro => outro,
-    })
+    }
+}
+
+/// Informações de um arquivo, obtidas sem baixá-lo.
+#[derive(Debug, Clone)]
+pub struct Info {
+    /// Tamanho informado pelo servidor, se houver.
+    pub tamanho: Option<u64>,
+    /// Se o servidor aceita baixar em partes (Range).
+    pub aceita_partes: bool,
+    /// Endereço final, depois dos redirecionamentos.
+    pub url_final: String,
+}
+
+/// Consulta o servidor para mostrar tamanho e suporte a partes antes de baixar.
+pub fn consultar(url: &str, cabecalhos: &[(String, String)], proxy: Option<&str>) -> Res<Info> {
+    let url = url.trim();
+    let sonda = criar_agente(proxy).and_then(|agent| sondar(&agent, url, cabecalhos));
+    sonda
+        .map(|s| Info {
+            tamanho: s.tamanho,
+            aceita_partes: s.range,
+            url_final: s.url_final,
+        })
+        .map_err(|e| limpar_erro(e, url))
+}
+
+/// Agente HTTP com timeouts e proxy opcional.
+fn criar_agente(proxy: Option<&str>) -> Res<ureq::Agent> {
+    let mut construtor = ureq::AgentBuilder::new()
+        .timeout_connect(TIMEOUT)
+        .timeout_read(TIMEOUT)
+        .user_agent(AGENTE);
+    if let Some(endereco) = proxy.map(str::trim).filter(|p| !p.is_empty()) {
+        let proxy = ureq::Proxy::new(endereco)
+            .map_err(|e| ErroDl::Permanente(format!("proxy inválido: {e}")))?;
+        construtor = construtor.proxy(proxy);
+    }
+    Ok(construtor.build())
 }
 
 fn executar_interno(cfg: &Config, ctl: &Ctl, log: &(dyn Fn(String) + Sync)) -> Res<()> {
@@ -438,16 +520,7 @@ fn executar_interno(cfg: &Config, ctl: &Ctl, log: &(dyn Fn(String) + Sync)) -> R
         ));
     }
 
-    let mut construtor = ureq::AgentBuilder::new()
-        .timeout_connect(TIMEOUT)
-        .timeout_read(TIMEOUT)
-        .user_agent(AGENTE);
-    if let Some(endereco) = cfg.proxy.as_deref().filter(|p| !p.trim().is_empty()) {
-        let proxy = ureq::Proxy::new(endereco.trim())
-            .map_err(|e| ErroDl::Permanente(format!("proxy inválido: {e}")))?;
-        construtor = construtor.proxy(proxy);
-    }
-    let agent = construtor.build();
+    let agent = criar_agente(cfg.proxy.as_deref())?;
 
     crate::registro::registrar(
         "INFO",
@@ -1374,6 +1447,35 @@ mod tests {
             Err(ErroDl::Permanente(_))
         ));
         let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn cookie_nao_aparece_nas_mensagens() {
+        let dados = dados_de_teste(20_000);
+        let conteudo = conteudo_de(Arc::clone(&dados), "\"v1\"");
+        conteudo.lock().unwrap().exige_cabecalho = true;
+        let url = servidor(conteudo, true);
+        let dir = pasta_tmp("cookie");
+
+        let mut c = cfg(url, dir.join("c.bin"), 2, 0);
+        c.cabecalhos = vec![
+            ("x-rajada-teste".into(), "sim".into()),
+            ("Cookie".into(), "sessao=SEGREDO123".into()),
+        ];
+        let linhas = Mutex::new(Vec::<String>::new());
+        let log = |m: String| linhas.lock().unwrap().push(m);
+        executar(&c, &Ctl::default(), &log).unwrap();
+        for linha in linhas.lock().unwrap().iter() {
+            assert!(!linha.contains("SEGREDO123"), "cookie vazou: {linha}");
+        }
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn mensagens_de_erro_sao_claras() {
+        assert!(explicar_status(404).contains("não encontrado"));
+        assert!(explicar_status(403).contains("acesso negado"));
+        assert!(explicar_status(503).starts_with("HTTP 503"));
     }
 
     #[test]

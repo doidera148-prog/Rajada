@@ -146,8 +146,12 @@ O workflow **CI** (`.github/workflows/ci.yml`) roda a cada push e em cada pull r
 
 - **rustfmt:** verifica a formatação do código.
 - **clippy:** procura bugs prováveis e trechos que podem ser simplificados, tratando avisos como erro.
-- **Testes:** roda todos os testes, em Windows, Linux e macOS.
-- **cargo-audit:** verifica vulnerabilidades conhecidas nas dependências.
+- **Testes:** roda todos os testes, em Windows e Linux a cada push. O macOS, que é o runner
+  mais caro, roda nas tags de versão (`v*`) e sob demanda, pela aba Actions.
+- **Teste de fumaça (Linux):** abre o programa sob um ambiente gráfico virtual e confere
+  que ele não encerra com erro. Hoje é só um aviso e não bloqueia o build.
+
+A verificação de vulnerabilidades (`cargo-audit`) roda no `diagnostico.sh`, no seu computador.
 
 Em push para o `main`, o mesmo workflow também **aplica as correções mecânicas**
 (`cargo fmt` e `cargo clippy --fix`) e envia o resultado ao `main`, mas só se os testes

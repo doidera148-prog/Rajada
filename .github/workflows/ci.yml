@@ -26,16 +26,16 @@ jobs:
     timeout-minutes: 20
     permissions:
       contents: read
-      checks: write
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
 
       - name: Instalar Rust
-        uses: dtolnay/rust-toolchain@stable
+        uses: dtolnay/rust-toolchain@39008827e6b4319a349e9a42dfc90579dd25f1ca # stable
         with:
+          toolchain: stable
           components: clippy, rustfmt
 
-      - uses: Swatinem/rust-cache@v2
+      - uses: Swatinem/rust-cache@d1527c8f67ef9af357290475d4af4b0fab8f12e0 # v2
 
       - name: Formatação (rustfmt)
         run: cargo fmt --check
@@ -45,12 +45,6 @@ jobs:
 
       - name: Testes
         run: cargo test --all-targets
-
-      - name: Vulnerabilidades nas dependências
-        uses: rustsec/audit-check@v2
-        continue-on-error: true
-        with:
-          token: ${{ secrets.GITHUB_TOKEN }}
 
   # Binários para Windows e Linux.
   build:
@@ -70,14 +64,15 @@ jobs:
     runs-on: ${{ matrix.os }}
     timeout-minutes: 30
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
 
       - name: Instalar Rust
-        uses: dtolnay/rust-toolchain@stable
+        uses: dtolnay/rust-toolchain@39008827e6b4319a349e9a42dfc90579dd25f1ca # stable
         with:
+          toolchain: stable
           targets: ${{ matrix.target }}
 
-      - uses: Swatinem/rust-cache@v2
+      - uses: Swatinem/rust-cache@d1527c8f67ef9af357290475d4af4b0fab8f12e0 # v2
         with:
           key: ${{ matrix.target }}
 
@@ -132,7 +127,7 @@ jobs:
 
       - name: Guardar log do teste de fumaça
         if: matrix.os == 'ubuntu-latest' && steps.fumaca.outcome == 'failure'
-        uses: actions/upload-artifact@v4
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
         with:
           retention-days: 7
           name: log-fumaca
@@ -146,7 +141,7 @@ jobs:
           cp "target/${{ matrix.target }}/release/${{ matrix.binario }}" "saida/${{ matrix.destino }}"
 
       - name: Publicar artefato
-        uses: actions/upload-artifact@v4
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
         with:
           retention-days: 7
           name: ${{ matrix.destino }}
@@ -154,17 +149,20 @@ jobs:
 
   # Binário universal para macOS (Apple Silicon e Intel).
   build-macos:
+    # macOS é o runner mais caro: roda em tags (release) e sob demanda.
+    if: github.event_name == 'workflow_dispatch' || startsWith(github.ref, 'refs/tags/v')
     runs-on: macos-latest
     timeout-minutes: 30
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
 
       - name: Instalar Rust
-        uses: dtolnay/rust-toolchain@stable
+        uses: dtolnay/rust-toolchain@39008827e6b4319a349e9a42dfc90579dd25f1ca # stable
         with:
+          toolchain: stable
           targets: aarch64-apple-darwin,x86_64-apple-darwin
 
-      - uses: Swatinem/rust-cache@v2
+      - uses: Swatinem/rust-cache@d1527c8f67ef9af357290475d4af4b0fab8f12e0 # v2
         with:
           key: macos
 
@@ -184,7 +182,7 @@ jobs:
             target/x86_64-apple-darwin/release/rajada
 
       - name: Publicar artefato
-        uses: actions/upload-artifact@v4
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
         with:
           retention-days: 7
           name: rajada-macos-universal
@@ -198,14 +196,15 @@ jobs:
     permissions:
       contents: write
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
 
       - name: Instalar Rust
-        uses: dtolnay/rust-toolchain@stable
+        uses: dtolnay/rust-toolchain@39008827e6b4319a349e9a42dfc90579dd25f1ca # stable
         with:
+          toolchain: stable
           components: clippy, rustfmt
 
-      - uses: Swatinem/rust-cache@v2
+      - uses: Swatinem/rust-cache@d1527c8f67ef9af357290475d4af4b0fab8f12e0 # v2
 
       - name: Aplicar correções automáticas
         run: |
@@ -244,7 +243,7 @@ jobs:
       contents: write
     steps:
       - name: Baixar binários
-        uses: actions/download-artifact@v4
+        uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4
         with:
           path: baixados
           merge-multiple: true
@@ -254,15 +253,22 @@ jobs:
           cd baixados
           sha256sum rajada-linux-x86_64 rajada-windows-x86_64.exe rajada-macos-universal > SHA256SUMS.txt
 
-      - name: Criar release
+      - name: Criar ou atualizar release
         env:
           GH_TOKEN: ${{ github.token }}
         run: |
-          gh release create "$GITHUB_REF_NAME" \
-            baixados/rajada-linux-x86_64 \
-            baixados/rajada-windows-x86_64.exe \
-            baixados/rajada-macos-universal \
-            baixados/SHA256SUMS.txt \
-            --repo "$GITHUB_REPOSITORY" \
-            --title "Rajada $GITHUB_REF_NAME" \
-            --generate-notes
+          arquivos=(
+            baixados/rajada-linux-x86_64
+            baixados/rajada-windows-x86_64.exe
+            baixados/rajada-macos-universal
+            baixados/SHA256SUMS.txt
+          )
+          # Se a release já existe (criada à mão, ou nova execução), só atualiza os arquivos.
+          if gh release view "$GITHUB_REF_NAME" --repo "$GITHUB_REPOSITORY" >/dev/null 2>&1; then
+            gh release upload "$GITHUB_REF_NAME" "${arquivos[@]}" --clobber --repo "$GITHUB_REPOSITORY"
+          else
+            gh release create "$GITHUB_REF_NAME" "${arquivos[@]}" \
+              --repo "$GITHUB_REPOSITORY" \
+              --title "Rajada $GITHUB_REF_NAME" \
+              --generate-notes
+          fi
